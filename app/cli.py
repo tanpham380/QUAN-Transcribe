@@ -1,8 +1,8 @@
 """Command line entrypoint.
 
-``quan-asr`` starts the server. The flags exist so the image can be launched
-directly by GPUStack (which always appends ``--model-path`` and ``--port``) as
-well as by hand.
+``quan-asr-server`` starts the server. The flags exist so the image can be
+launched directly by GPUStack (which always appends ``--model-path`` and
+``--port``) as well as by hand.
 """
 
 from __future__ import annotations
@@ -17,10 +17,12 @@ from . import __version__
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="quan-asr",
+        prog="quan-asr-server",
         description="OpenAI-compatible ASR server for QUAN-Transcribe-1.0.",
     )
-    parser.add_argument("--version", action="version", version=f"quan-asr {__version__}")
+    parser.add_argument(
+        "--version", action="version", version=f"quan-asr-server {__version__}"
+    )
     parser.add_argument(
         "--serve",
         action="store_true",

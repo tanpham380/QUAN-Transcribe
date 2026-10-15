@@ -1,4 +1,4 @@
-"""Modern Google Material 3 UI for QUAN-ASR playground & developer demo.
+"""Modern Google Material 3 UI for the QUAN-ASR Server playground & developer demo.
 
 Served at ``/``. Features:
 - Google Material Design 3 design system (Light / Dark themes, Google colors, typography)
@@ -904,7 +904,7 @@ INDEX_HTML = r"""<!doctype html>
     </div>
     <div>
       <div class="brand-title">
-        QUAN-ASR <span class="brand-tag">EmbeddingGemma 2 · CTC</span>
+        QUAN-ASR Server <span class="brand-tag">EmbeddingGemma 2 · CTC</span>
       </div>
     </div>
   </a>

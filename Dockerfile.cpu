@@ -88,5 +88,5 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=900s --retries=5 \
 
 EXPOSE 8000
 
-ENTRYPOINT ["quan-asr", "--serve"]
+ENTRYPOINT ["quan-asr-server", "--serve"]
 CMD ["--host", "0.0.0.0", "--port", "8000"]

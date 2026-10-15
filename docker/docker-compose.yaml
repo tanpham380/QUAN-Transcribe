@@ -12,7 +12,7 @@ x-common: &common
   build:
     context: ..
     dockerfile: Dockerfile
-  image: quan-asr:1.0.0
+  image: quan-asr-server:1.0.0
   volumes:
     # Keep the model, the EmbeddingGemma encoder and the KenLM model across
     # container restarts. Delete this volume to force a clean re-download.
@@ -43,14 +43,14 @@ x-common: &common
     retries: 5
 
 services:
-  quan-asr-cuda:
+  quan-asr-server-cuda:
     <<: *common
     build:
       context: ..
       dockerfile: Dockerfile
-    image: quan-asr:cuda
+    image: quan-asr-server:cuda
     profiles: ["gpu", "cuda"]
-    container_name: quan-asr-cuda
+    container_name: quan-asr-server-cuda
     ports:
       - "8000:8000"
     environment:
@@ -66,14 +66,14 @@ services:
               count: all
               capabilities: [gpu]
 
-  quan-asr-cpu:
+  quan-asr-server-cpu:
     <<: *common
     build:
       context: ..
       dockerfile: Dockerfile.cpu
-    image: quan-asr:cpu
+    image: quan-asr-server:cpu
     profiles: ["cpu"]
-    container_name: quan-asr-cpu
+    container_name: quan-asr-server-cpu
     ports:
       - "8001:8000"
     environment:

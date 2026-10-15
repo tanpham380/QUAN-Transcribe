@@ -67,7 +67,7 @@ settings = Settings.from_env()
 engine = TranscriptionEngine(settings)
 
 #: Extra model names OpenAI clients tend to send.
-_ALIASES = {"whisper-1", "quan-transcribe", "quan-transcribe-1.0", "quan-asr"}
+_ALIASES = {"whisper-1", "quan-transcribe", "quan-transcribe-1.0", "quan-asr", "quan-asr-server"}
 
 
 # --------------------------------------------------------------------------- #
@@ -82,7 +82,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     logger.info(
-        "starting QUAN-ASR %s (model=%s, device=%s, preload=%s)",
+        "starting QUAN-ASR Server %s (model=%s, device=%s, preload=%s)",
         __version__,
         settings.model_path,
         settings.device or "auto",
@@ -127,7 +127,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(
-    title="QUAN-ASR",
+    title="QUAN-ASR Server",
     version=__version__,
     description=(
         "OpenAI-compatible speech-to-text API for QUAN-Transcribe-1.0 "
@@ -267,7 +267,7 @@ _SAMPLES_DIR = _ROOT_DIR / "samples"
 _SCALAR_HTML = """<!doctype html>
 <html lang="en">
   <head>
-    <title>QUAN-ASR API Reference · Scalar</title>
+    <title>QUAN-ASR Server API Reference · Scalar</title>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%231a73e8'><path d='M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z'/></svg>" />

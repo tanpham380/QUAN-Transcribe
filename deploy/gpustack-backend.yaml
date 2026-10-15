@@ -1,4 +1,4 @@
-# GPUStack custom inference backend for QUAN-ASR.
+# GPUStack custom inference backend for QUAN-ASR Server.
 #
 # Import it on the Inference Backends page ("Add Backend" -> paste YAML) after
 # pushing the image. The name must end with "-custom".
@@ -18,7 +18,7 @@
 #
 # How the pieces fit together:
 #   image_name       the image built from this repository's Dockerfile
-#   run_command      appended to the image ENTRYPOINT (["quan-asr", "--serve"]),
+#   run_command      appended to the image ENTRYPOINT (["quan-asr-server", "--serve"]),
 #                    with {{model_path}}, {{model_name}}, {{port}} and
 #                    {{worker_ip}} substituted by GPUStack at deploy time
 #   custom_framework which workers can schedule this deployment onto
@@ -28,7 +28,7 @@
 # command line, which this server accepts as --model-path. Because the model is
 # already local, the server never downloads it again.
 
-backend_name: QUAN-ASR-custom
+backend_name: QUAN-ASR-Server-custom
 default_version: "1.0.0"
 health_check_path: /health
 description: >-
@@ -51,7 +51,7 @@ version_configs:
   "1.0.0":
     # Push the CI-built image (see .gitlab-ci.yml) and use its full path here,
     # e.g. $CI_REGISTRY_IMAGE/asr-engine:v-1.0.0-release
-    image_name: quan-asr:1.0.0
+    image_name: quan-asr-server:1.0.0
     custom_framework: cuda
     run_command: >-
       --model-path {{model_path}}
@@ -59,7 +59,7 @@ version_configs:
       --host {{worker_ip}}
       --port {{port}}
   "1.0.0-cpu":
-    image_name: quan-asr:1.0.0
+    image_name: quan-asr-server:1.0.0
     custom_framework: cpu
     # CPU profile: the CUDA runtime in the image is unused (and harmless), so
     # the same tag runs here. The device is pinned so a machine that happens to

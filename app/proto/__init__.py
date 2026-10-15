@@ -1,1 +1,1 @@
-"""gRPC protobuf package for QUAN-ASR."""
+"""gRPC protobuf package for QUAN-ASR Server."""

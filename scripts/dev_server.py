@@ -2,7 +2,7 @@
 
 This is a development aid: it exercises the actual ASGI stack, SSE framing and
 WebSocket handshake over the network without downloading the model. Not used in
-production, where the real ``app.server:app`` is served by ``quan-asr``.
+production, where the real ``app.server:app`` is served by ``quan-asr-server``.
 
     .venv/bin/python scripts/dev_server.py --port 8123
 """

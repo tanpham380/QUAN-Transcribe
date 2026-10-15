@@ -40,7 +40,7 @@ Inside the container:
 ```bash
 docker run --rm --env-file .env -v "$PWD":/work -w /work \
   -v quan-hf:/cache/huggingface -e HF_HOME=/cache/huggingface \
-  --entrypoint python quan-asr:1.0.0 scripts/repro_local.py samples/voicemail-90s.mp3
+  --entrypoint python quan-asr-server:1.0.0 scripts/repro_local.py samples/voicemail-90s.mp3
 ```
 
 ## Note on the content

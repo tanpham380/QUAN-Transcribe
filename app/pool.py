@@ -1,6 +1,6 @@
-"""Multi-GPU & Multi-Worker Engine Pool for QUAN-ASR.
+"""Multi-GPU & Multi-Worker Engine Pool for QUAN-ASR Server.
 
-Allows a single QUAN-ASR server process to orchestrate across multiple GPUs
+Allows a single QUAN-ASR Server process to orchestrate across multiple GPUs
 (e.g. ``cuda:0``, ``cuda:1``, etc.) or multi-core CPU workers, achieving linear
 throughput scaling and dynamic load balancing.
 """

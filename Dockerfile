@@ -75,6 +75,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && add-apt-repository -y ppa:deadsnakes/ppa \
     && apt-get update && apt-get install -y --no-install-recommends \
         python${PYTHON_VERSION} \
+    && apt-get purge -y software-properties-common \
+    && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python \
     && ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python3
@@ -105,5 +107,5 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=900s --retries=5 \
 
 EXPOSE 8000
 
-ENTRYPOINT ["quan-asr", "--serve"]
+ENTRYPOINT ["quan-asr-server", "--serve"]
 CMD ["--host", "0.0.0.0", "--port", "8000"]

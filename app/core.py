@@ -169,7 +169,7 @@ class EngineCore:
         subbatch_seconds: float = 0.0,
         max_queued_pieces: int = 0,
         max_queued_interactive: int = 0,
-        name: str = "quan-asr-core",
+        name: str = "quan-asr-server-core",
     ) -> None:
         self._run_batch = run_batch
         self._sample_rate = sample_rate

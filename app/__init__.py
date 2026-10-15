@@ -1,4 +1,4 @@
-"""QUAN-ASR: an OpenAI-compatible ASR API server for QUAN-Transcribe.
+"""QUAN-ASR Server: an OpenAI-compatible ASR API server for QUAN-Transcribe.
 
 The package exposes a FastAPI application (:mod:`app.server`) that wraps
 ``quan_transcribe.QuanTranscribe`` behind OpenAI's audio transcription API,

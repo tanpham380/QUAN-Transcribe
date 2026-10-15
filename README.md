@@ -1,4 +1,4 @@
-# QUAN-ASR
+# QUAN-ASR Server
 
 An OpenAI-compatible speech-to-text server for
 [`qnguyen3/QUAN-Transcribe-1.0`](https://huggingface.co/qnguyen3/QUAN-Transcribe-1.0),
@@ -96,7 +96,7 @@ Three invariants make the rest of the document make sense:
 python -m venv .venv && source .venv/bin/activate
 pip install "quan-transcribe @ git+https://github.com/qnguyen3/QUAN-Transcribe"
 pip install .
-quan-asr --serve --port 8000
+quan-asr-server --serve --port 8000
 ```
 
 Then, from another shell:
@@ -236,7 +236,7 @@ not need to know the deployment's exact name:
 - the configured `SERVED_MODEL_NAME` (default `QUAN-Transcribe-1.0`),
 - the `MODEL_PATH` value or the basename of the model directory,
 - and the aliases `whisper-1`, `quan-transcribe`, `quan-transcribe-1.0`,
-  `quan-asr`.
+  `quan-asr-server`.
 
 Anything else is `404 model_not_found`. The alias list is what makes this a
 drop-in replacement for code that hard-codes `model="whisper-1"`.
@@ -475,14 +475,14 @@ Vietnamese text:
 ```bash
 # Bundled LM: the model repo's lm/ folder (vi_4gram.bin, ~91 MB) downloads on
 # first use.
-USE_LM=true quan-asr --serve
+USE_LM=true quan-asr-server --serve
 
 # Your own KenLM model: a .bin/.arpa file, or a directory containing
 # vi_4gram.bin and optionally unigrams.txt / lm_config.json.
-LM_PATH=/models/vi_4gram.bin quan-asr --serve
+LM_PATH=/models/vi_4gram.bin quan-asr-server --serve
 
 # Tune the search.
-USE_LM=true BEAM_WIDTH=16 LM_ALPHA=0.5 LM_BETA=1.5 quan-asr --serve
+USE_LM=true BEAM_WIDTH=16 LM_ALPHA=0.5 LM_BETA=1.5 quan-asr-server --serve
 ```
 
 Or with flags: `--lm`, `--lm-path`, `--beam-width`, `--lm-alpha`, `--lm-beta`.
@@ -756,7 +756,7 @@ should be well below `jobs_run`, and `shed` should stay at zero.
 ## Docker
 
 ```bash
-./scripts/build.sh                          # -> quan-asr:1.0.0
+./scripts/build.sh                          # -> quan-asr-server:1.0.0
 TAG=registry.example.com/asr:1.0.0 ./scripts/build.sh
 INSTALL_LM=false ./scripts/build.sh         # skip the kenlm compile
 CUDA=12.4.1 TORCH_INDEX=https://download.pytorch.org/whl/cu124 ./scripts/build.sh
@@ -770,7 +770,7 @@ docker run --gpus all -p 8000:8000 \
   -v hf-cache:/cache/huggingface \
   -e HF_TOKEN=hf_... \
   -e USE_LM=true \
-  quan-asr:1.0.0
+  quan-asr-server:1.0.0
 ```
 
 `docker/docker-compose.yaml` ships two profiles built from the same image:
@@ -916,7 +916,7 @@ time and the time VAD saved. Inside the container:
 ```bash
 docker run --rm --env-file .env -v "$PWD":/work -w /work \
   -v quan-hf:/cache/huggingface -e HF_HOME=/cache/huggingface \
-  --entrypoint python quan-asr:1.0.0 scripts/repro_local.py samples/voicemail-90s.mp3
+  --entrypoint python quan-asr-server:1.0.0 scripts/repro_local.py samples/voicemail-90s.mp3
 ```
 
 ### Layout
@@ -931,7 +931,7 @@ app/engine.py     model wrapper, streaming, live sessions, scheduler wiring
 app/schemas.py    request validation, OpenAI-shaped errors
 app/server.py     FastAPI routes, SSE, WebSocket
 app/ui.py         browser playground
-app/cli.py        `quan-asr` entrypoint
+app/cli.py        `quan-asr-server` entrypoint
 app/__main__.py   `python -m app` shim
 ```
 

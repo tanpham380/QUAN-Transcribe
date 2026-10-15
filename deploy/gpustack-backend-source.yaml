@@ -14,10 +14,10 @@
 apiVersion: gpustack.ai/v1
 kind: InferenceBackendSource
 metadata:
-  name: quan-asr-custom
+  name: quan-asr-server-custom
 spec:
   content: |
-    backend_name: QUAN-ASR-custom
+    backend_name: QUAN-ASR-Server-custom
     default_version: "1.0.0"
     health_check_path: /health
     description: >-
@@ -30,7 +30,7 @@ spec:
       LOG_LEVEL: info
     version_configs:
       "1.0.0":
-        image_name: quan-asr:1.0.0
+        image_name: quan-asr-server:1.0.0
         built_in_frameworks: ["cuda"]
         run_command: >-
           --model-path {{model_path}}
@@ -38,7 +38,7 @@ spec:
           --host {{worker_ip}}
           --port {{port}}
       "1.0.0-cpu":
-        image_name: quan-asr:1.0.0
+        image_name: quan-asr-server:1.0.0
         built_in_frameworks: ["cpu"]
         env:
           DEVICE: cpu

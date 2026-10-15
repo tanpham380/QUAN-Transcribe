@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Build the QUAN-ASR image.
+# Build the QUAN-ASR Server image.
 #
-#   ./scripts/build.sh                     # -> quan-asr:1.0.0
-#   TAG=ghcr.io/me/quan-asr:1.0.0 ./scripts/build.sh
+#   ./scripts/build.sh                     # -> quan-asr-server:1.0.0
+#   TAG=ghcr.io/me/quan-asr-server:1.0.0 ./scripts/build.sh
 #   INSTALL_LM=false ./scripts/build.sh    # ~3x faster build, no beam search
 #   CUDA=12.4.1 ./scripts/build.sh         # different CUDA runtime base
 #
@@ -12,7 +12,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-TAG="${TAG:-quan-asr:1.0.0}"
+TAG="${TAG:-quan-asr-server:1.0.0}"
 INSTALL_LM="${INSTALL_LM:-true}"
 CUDA="${CUDA:-12.6.1}"
 TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu126}"

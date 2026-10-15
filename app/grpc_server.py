@@ -1,4 +1,4 @@
-"""Google Speech API v2 compatible gRPC Service for QUAN-ASR.
+"""Google Speech API v2 compatible gRPC Service for QUAN-ASR Server.
 
 Provides bidirectional streaming (StreamingRecognize) over HTTP/2 multiplexing,
 mirroring Google Cloud Speech-to-Text v2 semantics.
