@@ -1,8 +1,11 @@
-# GitLab CI for the QUAN-ASR Server image.
+# GitLab CI for the QUAN-ASR Server images.
 #
-# Builds and pushes the container image to the GitLab Container Registry, and
-# cuts a GitLab Release. There is deliberately no deploy stage: this image is
+# Builds and pushes TWO container images to the GitLab Container Registry, and
+# cuts a GitLab Release. There is deliberately no deploy stage: these images are
 # pulled by GPUStack, not run from a compose file on a deploy host.
+#
+#   build_gpu  ->  Dockerfile      (nvidia/cuda base, torch cu126)  => :<tag>-gpu
+#   build_cpu  ->  Dockerfile.cpu  (python:3.11-slim, torch cpu)    => :<tag>-cpu
 #
 # Triggers: a tag matching v-<something>-release (e.g. v1.0.0-release).
 # The build runs on the shared docker runner.
@@ -12,23 +15,23 @@ stages:
   - release
 
 variables:
-  # Pushed as $CI_REGISTRY_IMAGE/quan-asr-server:$CI_COMMIT_TAG and :latest
+  # Pushed as $CI_REGISTRY_IMAGE/quan-asr-server:<tag>-gpu (and -cpu).
   IMAGE_NAME: "$CI_REGISTRY_IMAGE/quan-asr-server"
   DOCKER_DRIVER: overlay2
   DOCKER_TLS_CERTDIR: ""
-  BUILDX_CACHE: "$CI_REGISTRY_IMAGE/quan-asr-server-cache:buildx"
   # kenlm has no wheel and is compiled from source inside the image. Set this to
   # "false" to skip it: the build gets much faster and the server then only does
   # greedy decoding (USE_LM must stay unset/false at runtime).
   INSTALL_LM: "true"
   # silero-vad + onnxruntime. Required by the CPU profiles, which set USE_VAD.
   INSTALL_VAD: "true"
-  # Base CUDA runtime the image is built on. Keep TORCH_INDEX in step with it.
+  # Base CUDA runtime the GPU image is built on. Keep TORCH_INDEX in step with it.
   CUDA: "12.6.1"
   TORCH_INDEX: "https://download.pytorch.org/whl/cu126"
   PYTHON_VERSION: "3.11"
 
-build_image:
+# Shared setup for both image builds. Each job overrides DOCKERFILE / VERSION_SUFFIX.
+.image_build:
   stage: build-image
   image: docker:28.3
   services:
@@ -36,7 +39,7 @@ build_image:
   tags:
     - docker-execuse-150
   rules:
-    - if: '$CI_COMMIT_TAG =~ /^v-.*-release$/'
+    - if: '$CI_COMMIT_TAG =~ /^v-?.*-release$/'
       when: on_success
     - when: never
   before_script:
@@ -53,13 +56,28 @@ build_image:
         --build-arg INSTALL_VAD=$INSTALL_VAD \
         --cache-from=type=registry,ref=$BUILDX_CACHE \
         --cache-to=type=registry,mode=max,ref=$BUILDX_CACHE \
-        -t "$IMAGE_NAME:$CI_COMMIT_TAG" \
-        -t "$IMAGE_NAME:latest" \
+        -t "$IMAGE_NAME:$CI_COMMIT_TAG$VERSION_SUFFIX" \
+        -t "$IMAGE_NAME:latest$VERSION_SUFFIX" \
         --push \
-        -f Dockerfile .
-    - echo "Pushed $IMAGE_NAME:$CI_COMMIT_TAG"
+        -f "$DOCKERFILE" .
+    - echo "Pushed $IMAGE_NAME:$CI_COMMIT_TAG$VERSION_SUFFIX"
   after_script:
     - docker buildx rm quan-builder || true
+
+build_gpu:
+  extends: .image_build
+  variables:
+    DOCKERFILE: Dockerfile
+    VERSION_SUFFIX: "-gpu"
+    BUILDX_CACHE: "$CI_REGISTRY_IMAGE/quan-asr-server-cache:buildx-gpu"
+
+build_cpu:
+  extends: .image_build
+  variables:
+    DOCKERFILE: Dockerfile.cpu
+    VERSION_SUFFIX: "-cpu"
+    BUILDX_CACHE: "$CI_REGISTRY_IMAGE/quan-asr-server-cache:buildx-cpu"
+
 
 
 release:
@@ -70,7 +88,7 @@ release:
   variables:
     GIT_DEPTH: 0
   rules:
-    - if: '$CI_COMMIT_TAG =~ /^v-.*-release$/'
+    - if: '$CI_COMMIT_TAG =~ /^v-?.*-release$/'
       when: on_success
     - when: never
   script:
@@ -83,16 +101,22 @@ release:
       echo "Changelog:"
       echo "$CHANGES"
 
+      DESCR=$(cat <<EOF
+      ## Container images
+
+      - GPU: \`$IMAGE_NAME:$CI_COMMIT_TAG-gpu\` (also tagged \`latest-gpu\`)
+      - CPU: \`$IMAGE_NAME:$CI_COMMIT_TAG-cpu\` (also tagged \`latest-cpu\`)
+
+      ## Changelog
+
+      $CHANGES
+      EOF
+      )
+
       release-cli create \
         --name "$CI_COMMIT_TAG" \
         --tag-name "$CI_COMMIT_TAG" \
         --ref "$CI_COMMIT_SHA" \
-        --description "## Container image
-
-\`$IMAGE_NAME:$CI_COMMIT_TAG\` (also tagged \`latest\`)
-
-## Changelog
-
-$CHANGES"
+        --description "$DESCR"
   environment:
     name: production

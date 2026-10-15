@@ -1,5 +1,6 @@
-# Keep the build context small: only pyproject.toml, README.md and app/ are
-# copied into the image, so anything else is dead weight in the build cache.
+# Keep the build context small: only pyproject.toml, README.md, app/ and
+# quan_transcribe/ are copied into the image, so anything else is dead weight in
+# the build cache.
 
 .git
 .gitignore

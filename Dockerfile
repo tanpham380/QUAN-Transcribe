@@ -43,6 +43,7 @@ RUN uv pip install torch --index-url ${TORCH_INDEX}
 WORKDIR /build
 COPY pyproject.toml README.md ./
 COPY app ./app
+COPY quan_transcribe ./quan_transcribe
 COPY samples ./samples
 
 ARG INSTALL_LM=true
@@ -88,6 +89,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 COPY pyproject.toml README.md ./
 COPY app ./app
+COPY quan_transcribe ./quan_transcribe
 COPY samples ./samples
 
 ENV HF_HOME=/cache/huggingface \

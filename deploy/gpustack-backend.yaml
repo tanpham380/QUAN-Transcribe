@@ -49,9 +49,9 @@ default_env:
   # API_KEY: "sk-..."   # require a bearer token on every request
 version_configs:
   "1.0.0":
-    # Push the CI-built image (see .gitlab-ci.yml) and use its full path here,
-    # e.g. $CI_REGISTRY_IMAGE/asr-engine:v-1.0.0-release
-    image_name: quan-asr-server:1.0.0
+    # Push the CI-built images (see .gitlab-ci.yml) and use their full path here,
+    # e.g. $CI_REGISTRY_IMAGE/quan-asr-server:v-1.0.0-release-gpu
+    image_name: quan-asr-server:v-1.0.0-release-gpu
     custom_framework: cuda
     run_command: >-
       --model-path {{model_path}}
@@ -59,10 +59,11 @@ version_configs:
       --host {{worker_ip}}
       --port {{port}}
   "1.0.0-cpu":
-    image_name: quan-asr-server:1.0.0
+    # e.g. $CI_REGISTRY_IMAGE/quan-asr-server:v-1.0.0-release-cpu
+    image_name: quan-asr-server:v-1.0.0-release-cpu
     custom_framework: cpu
-    # CPU profile: the CUDA runtime in the image is unused (and harmless), so
-    # the same tag runs here. The device is pinned so a machine that happens to
+    # CPU image: built from Dockerfile.cpu (torch CPU wheels), DEVICE=cpu is the
+    # image default; the device is pinned here too so a machine that happens to
     # have a GPU is still driven on the CPU when this version is chosen.
     env:
       DEVICE: cpu

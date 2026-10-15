@@ -30,7 +30,7 @@ spec:
       LOG_LEVEL: info
     version_configs:
       "1.0.0":
-        image_name: quan-asr-server:1.0.0
+        image_name: quan-asr-server:v-1.0.0-release-gpu
         built_in_frameworks: ["cuda"]
         run_command: >-
           --model-path {{model_path}}
@@ -38,7 +38,7 @@ spec:
           --host {{worker_ip}}
           --port {{port}}
       "1.0.0-cpu":
-        image_name: quan-asr-server:1.0.0
+        image_name: quan-asr-server:v-1.0.0-release-cpu
         built_in_frameworks: ["cpu"]
         env:
           DEVICE: cpu
