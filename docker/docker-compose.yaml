@@ -1,0 +1,84 @@
+# Two profiles, matching the two GPUStack backend versions:
+#
+#   docker compose --profile gpu up     # NVIDIA GPU
+#   docker compose --profile cpu up     # CPU only, no GPU reservation
+#
+# Both services build the same image; only the runtime configuration differs.
+# The GPU service pins nothing (the model auto-detects CUDA) and the CPU service
+# pins DEVICE=cpu and widens the micro-batch window, since CPU throughput comes
+# from batching and thread count rather than from a fast device.
+
+x-common: &common
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  image: quan-asr:1.0.0
+  volumes:
+    # Keep the model, the EmbeddingGemma encoder and the KenLM model across
+    # container restarts. Delete this volume to force a clean re-download.
+    - hf-cache:/cache/huggingface
+  environment: &common-env
+    MODEL_PATH: qnguyen3/QUAN-Transcribe-1.0
+    SERVED_MODEL_NAME: QUAN-Transcribe-1.0
+    PRELOAD: "true"
+    # The base encoder google/embeddinggemma-2 is gated on Hugging Face.
+    # Accept its terms, then put a read token here (or in .env).
+    HF_TOKEN: ${HF_TOKEN:-}
+    # Enable the bundled 4-gram KenLM for lower WER (CPU beam search).
+    USE_LM: ${USE_LM:-false}
+    # Streaming lookback. 0 keeps latency flat; omit for best accuracy.
+    LEFT_CHUNKS: ${LEFT_CHUNKS:-}
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+    # Uncomment to require a bearer token, like OpenAI's own API.
+    # API_KEY: ${API_KEY:-}
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+    interval: 30s
+    timeout: 5s
+    start_period: 900s
+    retries: 5
+
+services:
+  quan-asr-cuda:
+    <<: *common
+    profiles: ["gpu", "cuda"]
+    container_name: quan-asr-cuda
+    ports:
+      - "8000:8000"
+    environment:
+      <<: *common-env
+      # Auto-detect: uses CUDA when the device is visible.
+      DEVICE: ${DEVICE:-cuda}
+      TF32: "true"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  quan-asr-cpu:
+    <<: *common
+    profiles: ["cpu"]
+    container_name: quan-asr-cpu
+    ports:
+      - "8001:8000"
+    environment:
+      <<: *common-env
+      # Pin the device so a host that happens to expose a GPU still runs here.
+      DEVICE: cpu
+      # CPU decoding is one FP32 GEMM pipeline per core, so batching pays off
+      # with a wider gather window than the GPU default.
+      MICROBATCH_SECONDS: ${MICROBATCH_SECONDS:-0.25}
+      MICROBATCH_MAX_WAIT_MS: ${MICROBATCH_MAX_WAIT_MS:-50}
+      # Unset lets torch size itself to the visible cores. Set it when the
+      # container is limited by a cgroup quota, e.g. CPU_THREADS=4.
+      CPU_THREADS: ${CPU_THREADS:-}
+      # TF32 is a CUDA-only knob; leaving it on would just be a no-op here.
+      TF32: "false"
+    # No GPU reservation: this profile must run on a CPU-only host.
+
+volumes:
+  hf-cache:

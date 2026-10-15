@@ -1,0 +1,79 @@
+# GPUStack custom inference backend for QUAN-ASR.
+#
+# Import it on the Inference Backends page ("Add Backend" -> paste YAML) after
+# pushing the image. The name must end with "-custom".
+#
+# Two versions are declared so the same backend serves both worker profiles,
+# which is how GPUStack expresses "CPU or GPU": scheduling is filtered by the
+# version's framework, and "cpu" is accepted on any worker while "cuda" only
+# matches workers with an NVIDIA GPU.
+#
+#   version 1.0.0      framework cuda  -> scheduled onto GPU workers
+#   version 1.0.0-cpu  framework cpu   -> scheduled onto CPU-only workers
+#
+# The two differ only in the environment block: the CPU version pins the device
+# to the CPU and widens the micro-batch window, because on CPU the model is a
+# plain FP32 GEMM pipeline where throughput comes from batching and thread
+# count rather than from a fast device.
+#
+# How the pieces fit together:
+#   image_name       the image built from this repository's Dockerfile
+#   run_command      appended to the image ENTRYPOINT (["quan-asr", "--serve"]),
+#                    with {{model_path}}, {{model_name}}, {{port}} and
+#                    {{worker_ip}} substituted by GPUStack at deploy time
+#   custom_framework which workers can schedule this deployment onto
+#   health_check_path which route the worker polls to decide "model is ready"
+#
+# GPUStack mounts the downloaded model at {{model_path}} and passes it on the
+# command line, which this server accepts as --model-path. Because the model is
+# already local, the server never downloads it again.
+
+backend_name: QUAN-ASR-custom
+default_version: "1.0.0"
+health_check_path: /health
+description: >-
+  QUAN-Transcribe-1.0 Vietnamese ASR with an OpenAI-compatible transcription API,
+  SSE streaming and WebSocket live transcription. Ships a CUDA version and a
+  CPU-only version.
+default_env:
+  PRELOAD: "true"
+  HF_HOME: /cache/huggingface
+  LOG_LEVEL: info
+  # Set these to match your deployment:
+  # USE_LM: "true"      # 4-gram KenLM beam search, lower WER, CPU-bound
+  # LM_ALPHA: "0.3"     # LM weight; omit to use the value in lm_config.json
+  # LM_BETA: "1.0"      # word-insertion bonus; omit to use lm_config.json
+  # BEAM_WIDTH: "32"    # beams kept by the beam search
+  # LEFT_CHUNKS: "0"    # streaming lookback: 0 = lowest latency
+  # API_KEY: "sk-..."   # require a bearer token on every request
+version_configs:
+  "1.0.0":
+    # Push the GitLab-built image and use its full path here, e.g.
+    # gitlab.huongnghiepaau.com:5050/dev/asr-engine/asr-engine:v-1.0.0-release
+    image_name: quan-asr:1.0.0
+    custom_framework: cuda
+    run_command: >-
+      --model-path {{model_path}}
+      --served-model-name {{model_name}}
+      --host {{worker_ip}}
+      --port {{port}}
+  "1.0.0-cpu":
+    image_name: quan-asr:1.0.0
+    custom_framework: cpu
+    # CPU profile: the CUDA runtime in the image is unused (and harmless), so
+    # the same tag runs here. The device is pinned so a machine that happens to
+    # have a GPU is still driven on the CPU when this version is chosen.
+    env:
+      DEVICE: cpu
+      # CPU decoding is one FP32 GEMM pipeline per core, so batching is worth a
+      # wider gather window than the GPU default.
+      MICROBATCH_SECONDS: "0.25"
+      MICROBATCH_MAX_WAIT_MS: "50"
+      # Leave CPU_THREADS unset to let torch size itself to the visible cores;
+      # set it when the container is limited by a cgroup quota, e.g. "4".
+      # CPU_THREADS: "4"
+    run_command: >-
+      --model-path {{model_path}}
+      --served-model-name {{model_name}}
+      --host {{worker_ip}}
+      --port {{port}}
