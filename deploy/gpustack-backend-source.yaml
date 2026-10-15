@@ -5,6 +5,11 @@
 # source at this file, or at a URL serving it, and GPUStack materialises the
 # backend for you and keeps it in sync.
 #
+# The image_name in both files must be fully qualified (registry host + project
+# path), because GPUStack runs `docker pull <image_name>` verbatim on the worker.
+# The worker also needs credentials for registry.huongnghiepaau.com; see the
+# header of gpustack-backend.yaml.
+#
 # Differences from gpustack-backend.yaml:
 #   * every version is declared as predefined via built_in_frameworks, because a
 #     source document is authoritative for the versions it ships; GPUStack moves
@@ -30,7 +35,7 @@ spec:
       LOG_LEVEL: info
     version_configs:
       "1.0.0":
-        image_name: quan-asr-server:v1.0.0-release-gpu
+        image_name: registry.huongnghiepaau.com/dev/asr-engine/quan-asr-server:v1.0.0-release-gpu
         built_in_frameworks: ["cuda"]
         run_command: >-
           --model-path {{model_path}}
@@ -38,7 +43,7 @@ spec:
           --host {{worker_ip}}
           --port {{port}}
       "1.0.0-cpu":
-        image_name: quan-asr-server:v1.0.0-release-cpu
+        image_name: registry.huongnghiepaau.com/dev/asr-engine/quan-asr-server:v1.0.0-release-cpu
         built_in_frameworks: ["cpu"]
         env:
           DEVICE: cpu

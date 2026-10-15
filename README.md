@@ -1034,12 +1034,44 @@ Two things the image deliberately does **not** do:
 
 1. Build and push the images to a registry the workers can reach (the CI builds
    them — see [GitLab CI](#gitlab-ci)).
-2. On the **Inference Backends** page choose **Add Backend → Custom** and paste
+2. Make sure the **workers can pull the private image**. `docker pull` runs on
+   the worker, so either log in once on each worker host
+   (`docker login registry.huongnghiepaau.com`) or start the worker with
+   `GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY_USERNAME` and
+   `GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY_PASSWORD` set to a
+   `read_registry` deploy token. Without credentials the deployment fails with
+   `unauthorized`.
+3. On the **Inference Backends** page choose **Add Backend → Custom** and paste
    `deploy/gpustack-backend.yaml` (or apply
    `deploy/gpustack-backend-source.yaml` as an `InferenceBackendSource`).
    The `backend_name` must end in `-custom` — GPUStack enforces this.
-3. Point each version's `image_name` at the matching pushed image, then deploy
+4. Point each version's `image_name` at the matching pushed image, then deploy
    from that backend and pick the version that matches the worker.
+
+The two manifests hold the **same backend definition** and differ only in how
+GPUStack is meant to consume them:
+
+| File | Kind | Use it when |
+| --- | --- | --- |
+| `gpustack-backend.yaml` | a plain backend definition | you paste it into the UI or create the backend once by hand |
+| `gpustack-backend-source.yaml` | `InferenceBackendSource` | GPUStack is configured with a managed backend source (a FILE or URL source) and should materialise and keep the backend in sync itself |
+
+They are separate because a source document is authoritative for the versions
+it ships — GPUStack moves the framework list into `built_in_frameworks` and
+clears `custom_framework`, and a source cannot claim built-in status the way an
+imported backend does. Keeping both lets you start with the manual import and
+move to a managed source without rewriting the file.
+
+`image_name` must be **fully qualified** — registry host plus project path:
+
+```yaml
+image_name: registry.huongnghiepaau.com/dev/asr-engine/quan-asr-server:v1.0.0-release-gpu
+```
+
+GPUStack hands this string straight to `docker pull`, so a bare
+`quan-asr-server:…` would be resolved against Docker Hub and fail to pull. That
+path is exactly what `$CI_REGISTRY_IMAGE/quan-asr-server:<tag>-gpu` expands to
+in the pipeline, which is why the CI is the source of truth for the tag names.
 
 The manifest declares **two versions of the same backend**, which is how
 GPUStack expresses "CPU or GPU": scheduling is filtered by the version's
@@ -1048,8 +1080,8 @@ an NVIDIA GPU.
 
 | Version | Image | `custom_framework` | Env set by the version | Schedulable on |
 | --- | --- | --- | --- | --- |
-| `1.0.0` | `…-release-gpu` (`Dockerfile`) | `cuda` | none — inherits `default_env` | GPU workers |
-| `1.0.0-cpu` | `…-release-cpu` (`Dockerfile.cpu`) | `cpu` | `DEVICE=cpu`, `MICROBATCH_SECONDS=0.25`, `MICROBATCH_MAX_WAIT_MS=10`, `MAX_QUEUE=256`, `SUBBATCH_SECONDS=30` | any worker, no GPU needed |
+| `1.0.0` | `…/quan-asr-server:v1.0.0-release-gpu` (`Dockerfile`) | `cuda` | none — inherits `default_env` | GPU workers |
+| `1.0.0-cpu` | `…/quan-asr-server:v1.0.0-release-cpu` (`Dockerfile.cpu`) | `cpu` | `DEVICE=cpu`, `MICROBATCH_SECONDS=0.25`, `MICROBATCH_MAX_WAIT_MS=10`, `MAX_QUEUE=256`, `SUBBATCH_SECONDS=30` | any worker, no GPU needed |
 
 Each version points at its own image — CUDA wheels for the GPU version, CPU
 wheels for the CPU version — so neither ships a runtime it does not use. The
@@ -1091,11 +1123,12 @@ cache tag each). There is no `test` stage: the suite is meant to be run locally
 (`pytest -q`, no GPU or model needed) — add a `test` job if you want it gated in
 CI.
 
-Point `image_name` at the pushed tags:
+Point `image_name` at the pushed tags. The placeholder below expands to the
+fully qualified path GPUStack needs (see [Deploying on GPUStack](#deploying-on-gpustack)):
 
 ```yaml
-"1.0.0":      image_name: $CI_REGISTRY_IMAGE/quan-asr-server:v1.0.0-release-gpu
-"1.0.0-cpu":  image_name: $CI_REGISTRY_IMAGE/quan-asr-server:v1.0.0-release-cpu
+"1.0.0":      image_name: registry.huongnghiepaau.com/dev/asr-engine/quan-asr-server:v1.0.0-release-gpu
+"1.0.0-cpu":  image_name: registry.huongnghiepaau.com/dev/asr-engine/quan-asr-server:v1.0.0-release-cpu
 ```
 
 There is no deploy stage: GPUStack pulls the image itself when you deploy.

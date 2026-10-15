@@ -17,12 +17,25 @@
 # count rather than from a fast device.
 #
 # How the pieces fit together:
-#   image_name       the image built from this repository's Dockerfile
+#   image_name       the image built from this repository's Dockerfile. It must
+#                    be FULLY QUALIFIED (registry host + project path), because
+#                    GPUStack passes it to `docker pull` verbatim: a bare name
+#                    would be resolved against Docker Hub.
 #   run_command      appended to the image ENTRYPOINT (["quan-asr-server", "--serve"]),
 #                    with {{model_path}}, {{model_name}}, {{port}} and
 #                    {{worker_ip}} substituted by GPUStack at deploy time
 #   custom_framework which workers can schedule this deployment onto
 #   health_check_path which route the worker polls to decide "model is ready"
+#
+# Pulling from the private registry: `docker pull` runs on the worker, which
+# needs credentials for registry.huongnghiepaau.com or the deployment fails with
+# "unauthorized". Either log in on the worker host once:
+#   docker login registry.huongnghiepaau.com
+# or, when GPUStack performs the pull, start the worker with
+#   GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY_USERNAME=<user>
+#   GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY_PASSWORD=<token>
+# Use a read-only deploy token and pass it via the environment, not in this
+# file.
 #
 # GPUStack mounts the downloaded model at {{model_path}} and passes it on the
 # command line, which this server accepts as --model-path. Because the model is
@@ -49,9 +62,11 @@ default_env:
   # API_KEY: "sk-..."   # require a bearer token on every request
 version_configs:
   "1.0.0":
-    # Push the CI-built images (see .gitlab-ci.yml) and use their full path here,
-    # e.g. $CI_REGISTRY_IMAGE/quan-asr-server:v1.0.0-release-gpu
-    image_name: quan-asr-server:v1.0.0-release-gpu
+    # Fully qualified registry path. GPUStack runs this verbatim as
+    # `docker pull <image_name>` and never prepends `--system-default-container-registry`,
+    # so a bare name like `quan-asr-server:...` would resolve to Docker Hub and
+    # fail. This is exactly $CI_REGISTRY_IMAGE/quan-asr-server:<tag>-gpu.
+    image_name: registry.huongnghiepaau.com/dev/asr-engine/quan-asr-server:v1.0.0-release-gpu
     custom_framework: cuda
     run_command: >-
       --model-path {{model_path}}
@@ -59,8 +74,8 @@ version_configs:
       --host {{worker_ip}}
       --port {{port}}
   "1.0.0-cpu":
-    # e.g. $CI_REGISTRY_IMAGE/quan-asr-server:v1.0.0-release-cpu
-    image_name: quan-asr-server:v1.0.0-release-cpu
+    # Same image path, CPU build ($CI_REGISTRY_IMAGE/quan-asr-server:<tag>-cpu).
+    image_name: registry.huongnghiepaau.com/dev/asr-engine/quan-asr-server:v1.0.0-release-cpu
     custom_framework: cpu
     # CPU image: built from Dockerfile.cpu (torch CPU wheels), DEVICE=cpu is the
     # image default; the device is pinned here too so a machine that happens to
