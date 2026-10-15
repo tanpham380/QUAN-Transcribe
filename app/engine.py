@@ -1,4 +1,4 @@
-"""Thread-safe wrapper around ``quan_transcribe``.
+"""Model-owning wrapper around ``quan_transcribe``.
 
 Two properties drive the design:
 
@@ -6,9 +6,11 @@ Two properties drive the design:
   ``google/embeddinggemma-2`` audio tower must be downloaded and read once, then
   kept resident. Loading happens behind a lock, so a burst of concurrent
   requests triggers exactly one load.
-* **The model is not re-entrant here.** Decoding is a plain forward pass, but we
-  serialise calls anyway: it keeps VRAM use predictable and makes the numbers
-  reported by ``GET /metrics`` meaningful.
+* **The model is not re-entrant here.** Decoding is a plain forward pass, but it
+  mutates shared buffers, so exactly one thread may touch the model at a time.
+  Rather than a lock held for a whole decode, all access goes through
+  :class:`~app.core.EngineCore`: a dedicated model thread with a priority,
+  coalescing scheduler and bounded queues. See ``app/core.py`` for why.
 """
 
 from __future__ import annotations
@@ -23,8 +25,15 @@ from typing import Any
 import numpy as np
 
 from .audio import SAMPLE_RATE, Segment
-from .batch import PieceBatcher
 from .config import Settings
+from .core import EngineBusy, EngineCore
+
+__all__ = [
+    "EngineBusy",
+    "EngineNotReady",
+    "StreamEvent",
+    "TranscriptionEngine",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -58,16 +67,17 @@ class TranscriptionEngine:
         self.settings = settings
         self._asr: Any | None = None
         self._load_lock = threading.Lock()
-        self._run_lock = threading.RLock()
+        self._core_lock = threading.Lock()
         self._load_error: str | None = None
         self._load_seconds: float | None = None
         self._loaded_at: float | None = None
         self.requests = 0
         self.audio_seconds = 0.0
         self.decode_seconds = 0.0
-        # Cross-request batching. Created on load, once the sample-rate-derived
-        # budget can be trusted, and None when the feature is off.
-        self._batcher: PieceBatcher | None = None
+        # The one thread that touches the model. Created on load, once the
+        # sample-rate-derived budget can be trusted, and always present: even a
+        # single request runs through it, so there is exactly one code path.
+        self._core: EngineCore | None = None
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -87,14 +97,30 @@ class TranscriptionEngine:
     def load(self) -> Any:
         """Load the model if needed and return the ``QuanTranscribe`` instance."""
         if self._asr is not None:
+            self._ensure_core()
             return self._asr
         with self._load_lock:
             if self._asr is not None:
+                self._ensure_core()
                 return self._asr
             if self._load_error is not None:
                 raise EngineNotReady(self._load_error)
             self._asr = self._load()
             return self._asr
+
+    def _ensure_core(self) -> EngineCore:
+        """Return the model thread, starting it exactly once.
+
+        Called whenever the model is known to be resident, so the invariant
+        "loaded implies a core exists" holds no matter how ``_asr`` was set
+        (a real load, or a test injecting a stub).
+        """
+        if self._core is not None:
+            return self._core
+        with self._core_lock:
+            if self._core is None:
+                self._start_core()
+        return self._core
 
     def _load(self) -> Any:
         settings = self.settings
@@ -149,7 +175,7 @@ class TranscriptionEngine:
         self._load_seconds = time.time() - started
         self._loaded_at = time.time()
         self._configure_torch(asr)
-        self._start_batcher()
+        self._ensure_core()
         logger.info(
             "model ready in %.1fs on %s (profile=%s)",
             self._load_seconds,
@@ -183,23 +209,22 @@ class TranscriptionEngine:
             torch.set_num_threads(threads)
             logger.info("torch limited to %d CPU thread(s)", threads)
 
-    def _start_batcher(self) -> None:
-        """Bring up cross-request batching unless it is disabled."""
-        if self.settings.microbatch_seconds <= 0:
-            logger.info("micro-batching disabled (MICROBATCH_SECONDS=0)")
-            return
-        self._batcher = PieceBatcher(
+    def _start_core(self) -> None:
+        """Bring up the model thread with the configured scheduling knobs."""
+        self._core = EngineCore(
             self._run_batch,
             sample_rate=SAMPLE_RATE,
             window_ms=self.settings.microbatch_max_wait_ms,
             max_requests=self.settings.microbatch_max_requests,
             batch_seconds=self.settings.batch_seconds,
+            subbatch_seconds=self.settings.subbatch_seconds,
+            max_queued_pieces=self.settings.max_queue,
+            max_queued_interactive=self.settings.max_interactive,
         )
-        self._batcher.start()
+        self._core.start()
         logger.info(
-            "micro-batching on (window=%.0fms, max_requests=%d)",
-            self.settings.microbatch_max_wait_ms,
-            self.settings.microbatch_max_requests,
+            "engine core on (%s)",
+            self.settings.batching_summary,
         )
 
     def warmup(self) -> None:
@@ -210,8 +235,7 @@ class TranscriptionEngine:
             return
         silent = np.zeros(int(0.5 * SAMPLE_RATE), dtype=np.float32)
         try:
-            with self._run_lock:
-                asr._forward([silent], False, None)
+            self._submit(lambda: asr._forward([silent], False, None))
         except Exception:
             logger.debug("warmup failed", exc_info=True)
 
@@ -241,6 +265,10 @@ class TranscriptionEngine:
             "left_chunks": self.settings.left_chunks,
             "microbatch_seconds": self.settings.microbatch_seconds,
             "microbatch_max_requests": self.settings.microbatch_max_requests,
+            "microbatch_max_wait_ms": self.settings.microbatch_max_wait_ms,
+            "max_queue": self.settings.max_queue,
+            "max_interactive": self.settings.max_interactive,
+            "subbatch_seconds": self.settings.subbatch_seconds,
             "tf32": self.settings.tf32,
             "load_error": self._load_error,
             "load_seconds": self._load_seconds,
@@ -249,14 +277,14 @@ class TranscriptionEngine:
 
     def metrics(self) -> dict[str, Any]:
         rtf = (self.decode_seconds / self.audio_seconds) if self.audio_seconds else None
-        batcher = self._batcher.stats() if self._batcher is not None else None
+        core = self._core.stats() if self._core is not None else None
         return {
             "requests_total": self.requests,
             "audio_seconds_total": round(self.audio_seconds, 3),
             "decode_seconds_total": round(self.decode_seconds, 3),
             "realtime_factor": round(rtf, 4) if rtf else None,
             "loaded": self.is_loaded,
-            "batcher": batcher,
+            "core": core,
         }
 
     def describe_device(self) -> str:
@@ -296,52 +324,27 @@ class TranscriptionEngine:
             raise EngineNotReady("the model loaded without a KenLM decoder")
         return decoder
 
-    def _run_batch(self, wavs: list[np.ndarray], context: Any) -> list[str]:
-        """Run one already-grouped batch. Called on the batcher's thread.
+    def _submit(self, call):
+        """Run ``call`` on the model thread, or inline if the core is absent.
 
-        The batcher is single-threaded, but streaming and live sessions call the
-        model from their own threads, so the batch still takes ``_run_lock``: it
-        is the one place that guarantees only one forward pass is in flight.
+        The core only exists once the model is loaded. A few callers (``flush``
+        of a session that never decoded a block) can fire before that, and one
+        test constructs an engine without ever calling :meth:`load`; both fall
+        back to running directly, which is safe because in those cases nothing
+        else can be touching the model yet.
         """
+        core = self._core
+        if core is None:
+            return call()
+        return core.submit(call)
+
+    def _run_batch(self, wavs: list[np.ndarray], context: Any) -> list[str]:
+        """Model work for one bulk sub-batch. Called on the model thread only."""
         asr = self._asr
         if asr is None:  # pragma: no cover - guarded by load() before enqueue
             raise EngineNotReady("the model is not loaded")
         streaming, left_chunks, decoder, beam_width = context
-        with self._run_lock:
-            return asr._run(wavs, streaming, left_chunks, decoder, beam_width)
-
-    def _decode_locked(
-        self,
-        pieces: list[np.ndarray],
-        streaming: bool,
-        left_chunks: int | None,
-        *,
-        use_lm: bool | None = None,
-        beam_width: int | None = None,
-    ) -> list[str]:
-        """Decode pieces, taking the model lock only when there is no batcher.
-
-        When the batcher is active it serialises batches itself, and its runner
-        takes ``_run_lock``. Holding the lock here as well would deadlock, since
-        this thread has to wait for the collector to run and the collector has
-        to wait for the lock this thread is holding.
-        """
-        if self._batcher is not None:
-            return self._decode_pieces(
-                pieces,
-                streaming,
-                left_chunks,
-                use_lm=use_lm,
-                beam_width=beam_width,
-            )
-        with self._run_lock:
-            return self._decode_pieces(
-                pieces,
-                streaming,
-                left_chunks,
-                use_lm=use_lm,
-                beam_width=beam_width,
-            )
+        return asr._run(wavs, streaming, left_chunks, decoder, beam_width)
 
     def _decode_pieces(
         self,
@@ -352,15 +355,11 @@ class TranscriptionEngine:
         use_lm: bool | None = None,
         beam_width: int | None = None,
     ) -> list[str]:
-        """Decode pieces, letting concurrent requests share a forward pass.
-
-        With micro-batching on, the pieces go through the collector so that
-        requests arriving together are padded and launched once. With it off
-        this is the plain length-sorted batching the upstream library uses.
-        """
+        """Decode pieces, letting the core coalesce them with other work."""
         asr = self._asr
         if asr is None:
             raise EngineNotReady("the model is not loaded")
+        core = self._ensure_core()
         decoder = self._decoder(use_lm)
         # Beam search is CPU-bound and dominates on a GPU, so an unsupported
         # request is worth warning about rather than ignoring.
@@ -371,47 +370,11 @@ class TranscriptionEngine:
             )
         beam_width = beam_width or self.settings.beam_width
 
-        batcher = self._batcher
-        if batcher is not None:
-            # The decoder has to be part of both the grouping key and the
-            # context, so that greedy and beam pieces never share a launch.
-            signature = (bool(streaming), left_chunks, id(decoder), beam_width)
-            context = (bool(streaming), left_chunks, decoder, beam_width)
-            return batcher.decode(pieces, signature, context)
-
-        return self._decode_serial(
-            pieces, streaming, left_chunks, decoder, beam_width
-        )
-
-    def _decode_serial(
-        self,
-        pieces: list[np.ndarray],
-        streaming: bool,
-        left_chunks: int | None,
-        decoder: Any,
-        beam_width: int,
-    ) -> list[str]:
-        """The upstream batching strategy: one call, length-sorted pieces."""
-        asr = self._asr
-        batch_seconds = self.settings.batch_seconds
-        texts: list[str | None] = [None] * len(pieces)
-        order = sorted(range(len(pieces)), key=lambda k: len(pieces[k]))
-        batch: list[int] = []
-
-        for k in [*order, None]:
-            if k is not None:
-                longest = len(pieces[k]) / SAMPLE_RATE
-                if not batch or longest * (len(batch) + 1) <= batch_seconds:
-                    batch.append(k)
-                    continue
-            if batch:
-                wavs = [pieces[b] for b in batch]
-                results = asr._run(wavs, streaming, left_chunks, decoder, beam_width)
-                for index, text in zip(batch, results, strict=False):
-                    texts[index] = text
-            batch = [k] if k is not None else []
-
-        return [t or "" for t in texts]
+        # The decoder has to be part of both the grouping key and the context,
+        # so that greedy and beam pieces never share a launch.
+        signature = (bool(streaming), left_chunks, id(decoder), beam_width)
+        context = (bool(streaming), left_chunks, decoder, beam_width)
+        return core.submit_bulk(pieces, signature, context)
 
     def transcribe(
         self,
@@ -442,7 +405,7 @@ class TranscriptionEngine:
         offsets = [(p[1], p[2]) for p in pieces_and_offsets]
 
         started = time.time()
-        texts = self._decode_locked(
+        texts = self._decode_pieces(
             pieces,
             streaming,
             left_chunks,
@@ -482,10 +445,9 @@ class TranscriptionEngine:
         last_end = 0.0
         started = time.time()
 
-        # The lock is taken per step rather than around the whole loop. A long
-        # SSE stream is a sequence of independent 0.48 s decodes, so releasing
-        # between them lets other requests through instead of making a slow
-        # stream block the server for its full duration.
+        # Each step is scheduled independently on the model thread, so a long
+        # SSE stream is a sequence of short interactive jobs: other requests
+        # interleave between them instead of waiting for the whole stream.
         while consumed < total:
             block = wav[consumed : consumed + step]
             consumed += len(block)
@@ -497,8 +459,7 @@ class TranscriptionEngine:
             if partial:
                 yield StreamEvent("partial", partial, last_end, now)
 
-        with self._run_lock:
-            tail = session.flush()
+        tail = self._submit(session.flush)
         if tail:
             yield StreamEvent("final", tail, last_end, total / SAMPLE_RATE)
 
@@ -506,18 +467,19 @@ class TranscriptionEngine:
         yield StreamEvent("done", "", last_end, total / SAMPLE_RATE)
 
     def _session_step(self, session: Any, block: np.ndarray) -> tuple[list[str], str]:
-        """Advance a live session by one block, under the model lock.
+        """Advance a live session by one block, as one interactive job.
 
         ``LiveSession.accept`` both decodes the partial hypothesis and may
-        finalise a finished utterance, so the whole call is one critical
-        section. It deliberately does not go through the batcher: streaming is
-        already incremental, and delaying a 0.48 s step to gather companions
-        would only add latency to the one path where it is visible.
+        finalise a finished utterance, so the whole call is one atomic critical
+        section on the model thread. It is submitted as *interactive* work, so
+        it preempts queued bulk pieces rather than waiting behind them: a 0.48 s
+        microphone step should never queue behind a ten-minute file.
         """
-        with self._run_lock:
+        def step() -> tuple[list[str], str]:
             finals = session.accept(block)
-            partial = session.partial
-        return finals, partial
+            return finals, session.partial
+
+        return self._submit(step)
 
     def stream_segments(
         self,
@@ -591,11 +553,13 @@ class TranscriptionEngine:
         self.decode_seconds += decode_seconds
 
     def close(self) -> None:
-        if self._batcher is not None:
-            self._batcher.stop()
-            self._batcher = None
-        with self._run_lock:
-            self._asr = None
+        core, self._core = self._core, None
+        if core is not None:
+            # Stop the model thread first: it is the only owner of the model, so
+            # once it has drained there is no forward pass in flight to race the
+            # teardown below.
+            core.stop()
+        self._asr = None
         try:  # pragma: no cover - only meaningful on CUDA
             import torch
 
@@ -611,8 +575,9 @@ class LiveStream:
     """A push-based live stream, used by the WebSocket endpoint.
 
     Feed 16 kHz mono float32 audio with :meth:`accept` and read back the events
-    the server should forward. All model access goes through the engine's lock,
-    which is held only for the duration of a single :meth:`accept` call.
+    the server should forward. Every model call goes through the engine core as
+    interactive work, so a live session preempts bulk transcription instead of
+    waiting behind it.
     """
 
     def __init__(
@@ -670,12 +635,22 @@ class LiveStream:
             )
 
         audio = self._pending
-        self._pending = np.zeros(0, dtype=np.float32)
         self._consumed += audio.size
         now = self._consumed / SAMPLE_RATE
 
+        try:
+            finals, partial = self.engine._session_step(self._session, audio)
+        except EngineBusy:
+            # Shed rather than block: put the audio back so the next frame
+            # retries it together with whatever arrives, instead of dropping a
+            # chunk of the user's speech. The byte counter stays advanced, so
+            # the cap on received audio is unaffected.
+            self._pending = audio
+            self._consumed -= audio.size
+            raise
+        self._pending = np.zeros(0, dtype=np.float32)
+
         events: list[StreamEvent] = []
-        finals, partial = self.engine._session_step(self._session, audio)
         for final in finals:
             events.append(StreamEvent("final", final, self._last_end, now))
             self._last_end = now
@@ -704,11 +679,11 @@ class LiveStream:
             self._closed = True
             return text
 
-        with self.engine._run_lock:
-            text = self._session.flush()
+        text = self.engine._submit(self._session.flush)
         self._pending = np.zeros(0, dtype=np.float32)
         self._closed = True
         return text
+
     def close(self) -> None:
         self._closed = True
         self._session = None

@@ -82,6 +82,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="streaming: past 0.48s chunks the reader may attend to (default: all)",
     )
     parser.add_argument("--chunk-seconds", type=float, default=None)
+    parser.add_argument(
+        "--subbatch-seconds",
+        type=float,
+        default=None,
+        help="longest single forward pass in audio seconds; a big file is "
+        "split across launches so live audio can preempt between them "
+        "(0 = no cap, default)",
+    )
     parser.add_argument("--endpoint-seconds", type=float, default=None)
     parser.add_argument("--stream-step-seconds", type=float, default=None)
     parser.add_argument(
@@ -96,6 +104,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="how long a request waits for companions to batch with (default 20)",
+    )
+    parser.add_argument(
+        "--max-queue",
+        type=int,
+        default=None,
+        help="most audio pieces that may wait to decode; 0 is unbounded "
+        "(default 256). Full queue -> HTTP 503",
+    )
+    parser.add_argument(
+        "--max-interactive",
+        type=int,
+        default=None,
+        help="most streaming (interactive) jobs in flight; 0 is unbounded "
+        "(default 64)",
     )
     parser.add_argument(
         "--cpu-threads",
@@ -131,6 +153,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "model_path": args.model_path,
         "host": args.host,
         "port": args.port,
+        "subbatch_seconds": args.subbatch_seconds,
         "device": args.device,
         "served_model_name": args.served_model_name,
         "lm_path": args.lm_path,
@@ -143,6 +166,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "stream_step_seconds": args.stream_step_seconds,
         "microbatch_seconds": args.microbatch_seconds,
         "microbatch_max_wait_ms": args.microbatch_max_wait_ms,
+        "max_queue": args.max_queue,
+        "max_interactive": args.max_interactive,
         "cpu_threads": args.cpu_threads,
         "tf32": False if args.no_tf32 else None,
         "api_key": args.api_key,
@@ -188,9 +213,12 @@ _ENV_FOR_SETTING = {
     "lm_beta": "LM_BETA",
     "beam_width": "BEAM_WIDTH",
     "left_chunks": "LEFT_CHUNKS",
+    "subbatch_seconds": "SUBBATCH_SECONDS",
     "chunk_seconds": "CHUNK_SECONDS",
     "endpoint_s": "ENDPOINT_SECONDS",
     "stream_step_seconds": "STREAM_STEP_SECONDS",
+    "max_queue": "MAX_QUEUE",
+    "max_interactive": "MAX_INTERACTIVE",
     "microbatch_seconds": "MICROBATCH_SECONDS",
     "microbatch_max_wait_ms": "MICROBATCH_MAX_WAIT_MS",
     "cpu_threads": "CPU_THREADS",

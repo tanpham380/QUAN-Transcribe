@@ -27,6 +27,22 @@ from app.schemas import APIError, parse_transcription_form
 # config
 # --------------------------------------------------------------------------- #
 
+def _collect_errors(errors, call, *args):
+    """Wrap a callable for a test thread, recording rather than raising.
+
+    A thread that raises prints an unhandled-exception warning, which is noisy
+    and can fail the suite under ``-W error``; collecting the exception lets the
+    test assert on it instead.
+    """
+
+    def run():
+        try:
+            call(*args)
+        except BaseException as exc:
+            errors.append(exc)
+
+    return run
+
 
 def test_settings_defaults():
     settings = Settings.from_env()
@@ -462,6 +478,8 @@ def test_microbatch_defaults_are_on():
     assert settings.microbatch_seconds == 0.15
     assert settings.microbatch_max_wait_ms == 20.0
     assert settings.microbatch_max_requests == 8
+    assert settings.max_queue == 256
+    assert settings.max_interactive == 64
     assert settings.tf32 is True
     assert settings.cpu_threads is None
 
@@ -474,15 +492,37 @@ def test_zero_wait_is_preserved(monkeypatch):
     monkeypatch.setenv("MICROBATCH_MAX_WAIT_MS", "0")
     assert Settings.from_env().microbatch_max_wait_ms == 0.0
 
-def test_batcher_groups_concurrent_requests(tmp_path):
+def test_queue_caps_from_env(monkeypatch):
+    monkeypatch.setenv("MAX_QUEUE", "0")
+    monkeypatch.setenv("MAX_INTERACTIVE", "4")
+    settings = Settings.from_env()
+    # 0 is meaningful here too: it disables the cap rather than parsing to 0.
+    assert settings.max_queue == 0
+    assert settings.max_interactive == 4
+
+# --------------------------------------------------------------------------- #
+# engine core (the scheduler that owns the model)
+# --------------------------------------------------------------------------- #
+
+def _start_core(engine, **overrides):
+    """Attach a scripted model to the engine and bring its core up.
+
+    Tests drive the scheduler directly rather than the model: the run function
+    is a Python callable, so the whole priority / coalescing / backpressure
+    surface is exercised without torch.
+    """
+    settings = replace(engine.settings, **overrides)
+    engine.settings = settings
+    engine._asr = _StubAsr()
+    engine._start_core()
+    return engine._core
+
+def test_core_coalesces_concurrent_requests():
     """Two overlapping requests should share one forward pass, not two."""
     import threading
 
-    engine = _engine(microbatch_seconds=0.15, microbatch_max_wait_ms=50.0)
-    stub = _StubAsr()
-    stub.run_calls = []
-    engine._asr = stub
-    engine._start_batcher()
+    engine = _engine()
+    core = _start_core(engine, microbatch_seconds=0.15, microbatch_max_wait_ms=50.0)
     try:
         barrier = threading.Barrier(2)
 
@@ -496,91 +536,332 @@ def test_batcher_groups_concurrent_requests(tmp_path):
         for thread in threads:
             thread.join(timeout=5)
 
-        stats = engine._batcher.stats()
+        stats = core.stats()
         assert stats["pieces_run"] == 2
         # The whole point: two requests, one launch.
-        assert engine._batcher.batches_run == 1
+        assert stats["batches_run"] == 1
     finally:
         engine.close()
 
-def test_batcher_packs_by_padded_cost():
+def test_core_packs_by_padded_cost():
     """A long piece must not drag an unrelated short one into its batch."""
-    from app.batch import PieceBatcher
+    from app.core import EngineCore
 
     seen: list[list[int]] = []
-
-    def run(wavs, _context):
-        seen.append([len(w) for w in wavs])
-        return ["" for _ in wavs]
-
-    batcher = PieceBatcher(
-        run,
+    core = EngineCore(
+        lambda wavs, _ctx: (seen.append([len(w) for w in wavs]), ["" for _ in wavs])[1],
         sample_rate=100,
         window_ms=0.0,
         max_requests=8,
         batch_seconds=1.0,  # 100 samples of padded cost
     )
-    batcher.start()
+    core.start()
     try:
-        # 100 + 100 does not fit a budget of 100, so each gets its own batch;
-        # ascending order means the short one is decoded first.
-        batcher.decode(
-            [np.zeros(10, dtype=np.float32), np.zeros(100, dtype=np.float32)],
-            ("sig",),
+        # 100 + 100 does not fit a budget of 100, so each gets its own batch.
+        results = core.submit_bulk(
+            [np.zeros(10, dtype=np.float32), np.zeros(100, dtype=np.float32)], ("s",)
         )
+        assert results == ["", ""]
     finally:
-        batcher.stop()
+        core.stop()
     assert [len(group) for group in seen] == [1, 1]
 
-def test_batcher_keeps_different_signatures_apart():
-    from app.batch import PieceBatcher
+def test_core_keeps_different_signatures_apart():
+    from app.core import EngineCore
 
     calls: list[tuple] = []
-
-    def run(wavs, context):
-        calls.append((context, len(wavs)))
-        return ["" for _ in wavs]
-
-    batcher = PieceBatcher(
-        run, sample_rate=100, window_ms=0.0, max_requests=8, batch_seconds=10.0
+    core = EngineCore(
+        lambda wavs, ctx: (calls.append((ctx, len(wavs))), ["" for _ in wavs])[1],
+        sample_rate=100,
+        window_ms=0.0,
+        max_requests=8,
+        batch_seconds=10.0,
     )
-    batcher.start()
+    core.start()
     try:
-        results = batcher.decode(
+        results = core.submit_bulk(
             [np.zeros(5, dtype=np.float32), np.zeros(5, dtype=np.float32)],
             ("greedy",),
             context="greedy",
         )
-        assert len(results) == 2
+        assert results == ["", ""]
     finally:
-        batcher.stop()
+        core.stop()
+    # One signature, one launch, the context passed through verbatim.
     assert calls == [("greedy", 2)]
 
-def test_batcher_propagates_errors():
-    from app.batch import PieceBatcher
+def test_core_propagates_model_errors():
+    from app.core import EngineCore
 
-    def run(wavs, _context):
+    def boom(_wavs, _ctx):
         raise RuntimeError("cuda out of memory")
 
-    batcher = PieceBatcher(
-        run, sample_rate=100, window_ms=0.0, max_requests=8, batch_seconds=10.0
+    core = EngineCore(
+        boom, sample_rate=100, window_ms=0.0, max_requests=8, batch_seconds=10.0
     )
-    batcher.start()
+    core.start()
     try:
         with pytest.raises(RuntimeError, match="cuda out of memory"):
-            batcher.decode([np.zeros(5, dtype=np.float32)], ("sig",))
+            core.submit_bulk([np.zeros(5, dtype=np.float32)], ("s",))
     finally:
-        batcher.stop()
+        core.stop()
 
-def test_decode_serial_is_used_without_a_batcher():
-    """With batching off the engine must not even construct a collector."""
-    engine = _engine(microbatch_seconds=0)
+def test_core_sheds_when_the_queue_is_full():
+    """Backpressure: a full queue refuses work instead of growing latency."""
+    import threading
+    import time
+
+    from app.core import EngineBusy, EngineCore
+
+    release = threading.Event()
+    entered = threading.Event()
+    def slow(wavs, _ctx):
+        entered.set()
+        release.wait(timeout=5)
+        return ["" for _ in wavs]
+
+    core = EngineCore(
+        slow,
+        sample_rate=100,
+        window_ms=0.0,
+        max_requests=8,
+        batch_seconds=10.0,
+        max_queued_pieces=2,
+    )
+    core.start()
+
+    def blocker():
+        entered.set()
+        release.wait(timeout=5)
+
+    errors: list[BaseException] = []
+    try:
+        # Hold the model thread so anything submitted next stays queued.
+        hold = threading.Thread(target=_collect_errors(errors, core.submit, blocker))
+        hold.start()
+        assert entered.wait(timeout=5)
+
+        queued = threading.Thread(
+            target=_collect_errors(
+                errors,
+                core.submit_bulk,
+                [np.zeros(2, dtype=np.float32)] * 2,
+                ("s",),
+            )
+        )
+        queued.start()
+        for _ in range(200):
+            if core.queued_pieces == 2:
+                break
+            time.sleep(0.005)
+
+        # The cap is two pieces; a third is refused outright.
+        with pytest.raises(EngineBusy, match="queue is full"):
+            core.submit_bulk([np.zeros(2, dtype=np.float32)], ("s",))
+    finally:
+        release.set()
+        core.stop()
+    # A shutdown that shed the queued piece is expected, not a failure.
+    assert not [e for e in errors if not isinstance(e, EngineBusy)]
+
+def test_core_preempts_bulk_with_interactive_work():
+    """An interactive job jumps ahead of a queued sub-batch."""
+    import threading
+    import time
+
+    from app.core import EngineBusy, EngineCore
+
+    first_started = threading.Event()
+    release = threading.Event()
+    order: list[str] = []
+
+    def run(wavs, _ctx):
+        if not first_started.is_set():
+            first_started.set()
+            release.wait(timeout=5)
+        order.append("bulk")
+        return ["" for _ in wavs]
+
+    core = EngineCore(
+        run,
+        sample_rate=100,
+        window_ms=0.0,
+        max_requests=8,
+        # A 100-sample budget puts the two 100-sample pieces in two sub-batches,
+        # which is what gives the scheduler a boundary to preempt at.
+        batch_seconds=1.0,
+    )
+    core.start()
+    errors: list[BaseException] = []
+    try:
+        bulk = threading.Thread(
+            target=_collect_errors(
+                errors,
+                core.submit_bulk,
+                [np.zeros(100, dtype=np.float32), np.zeros(100, dtype=np.float32)],
+                ("s",),
+            )
+        )
+        bulk.start()
+        assert first_started.wait(timeout=5)
+
+        interactive = threading.Thread(
+            target=_collect_errors(
+                errors, core.submit, lambda: order.append("interactive")
+            )
+        )
+        interactive.start()
+        # Wait until it is actually queued, or the preemption check races it.
+        for _ in range(200):
+            if core.queued_interactive == 1:
+                break
+            time.sleep(0.005)
+        release.set()
+
+        interactive.join(timeout=5)
+        bulk.join(timeout=5)
+    finally:
+        release.set()
+        core.stop()
+    # A shutdown mid-flight is expected; a scheduling failure is not.
+    assert not [e for e in errors if not isinstance(e, EngineBusy)]
+    # Sub-batch 1 runs, the interactive job preempts sub-batch 2, then it runs.
+    assert order == ["bulk", "interactive", "bulk"]
+
+def test_core_dispatches_interactive_without_waiting_for_the_window():
+    """The coalescing window must never delay an interactive job."""
+    import time as _time
+
+    from app.core import EngineCore
+
+    core = EngineCore(
+        lambda wavs, _ctx: ["" for _ in wavs],
+        sample_rate=100,
+        window_ms=500.0,  # a deliberately long gather
+        max_requests=8,
+        batch_seconds=10.0,
+    )
+    core.start()
+    try:
+        started = _time.monotonic()
+        assert core.submit(lambda: "now") == "now"
+        assert (_time.monotonic() - started) < 0.25
+    finally:
+        core.stop()
+
+def test_subbatch_cap_splits_one_large_request():
+    """A single big request must become several launches, not one.
+
+    Without the cap its pieces all fit one forward pass, which the scheduler
+    cannot preempt — so a live session would wait for the whole file. The cap
+    is what creates the boundaries preemption needs.
+    """
+    from app.core import EngineCore
+
+    seen: list[int] = []
+    core = EngineCore(
+        lambda wavs, _ctx: (seen.append(len(wavs)), ["" for _ in wavs])[1],
+        sample_rate=100,
+        window_ms=0.0,
+        max_requests=8,
+        batch_seconds=1000.0,  # room for everything...
+        subbatch_seconds=1.0,  # ...but each pass covers at most 2 pieces
+    )
+    core.start()
+    try:
+        # 50-sample pieces: padded cost is 50*k, so a 100-sample budget admits
+        # exactly two per pass.
+        results = core.submit_bulk([np.zeros(50, dtype=np.float32)] * 5, ("s",))
+        assert results == [""] * 5
+    finally:
+        core.stop()
+    # 5 pieces, 2 per pass -> 3 launches instead of 1.
+    assert seen == [2, 2, 1]
+
+def test_subbatch_cap_lets_a_live_job_interrupt_a_long_file():
+    """The regression: a long file must not block a live step end to end."""
+    import threading
+    import time
+
+    from app.core import EngineBusy, EngineCore
+
+    release = threading.Event()
+    first_done = threading.Event()
+    order: list[str] = []
+
+    def run(wavs, _ctx):
+        order.append("bulk")
+        if not first_done.is_set():
+            first_done.set()
+            release.wait(timeout=5)
+        return ["" for _ in wavs]
+
+    core = EngineCore(
+        run,
+        sample_rate=100,
+        window_ms=0.0,
+        max_requests=8,
+        batch_seconds=1000.0,
+        subbatch_seconds=0.1,  # a 10-sample pass: exactly one piece per launch
+    )
+    core.start()
+    errors: list[BaseException] = []
+    try:
+        bulk = threading.Thread(
+            target=_collect_errors(
+                errors, core.submit_bulk, [np.zeros(10, dtype=np.float32)] * 4, ("s",)
+            )
+        )
+        bulk.start()
+        assert first_done.wait(timeout=5)
+
+        live = threading.Thread(
+            target=_collect_errors(
+                errors, core.submit, lambda: order.append("interactive")
+            )
+        )
+        live.start()
+        for _ in range(200):
+            if core.queued_interactive == 1:
+                break
+            time.sleep(0.005)
+        release.set()
+
+        live.join(timeout=5)
+        bulk.join(timeout=5)
+    finally:
+        release.set()
+        core.stop()
+    assert not [e for e in errors if not isinstance(e, EngineBusy)]
+    # The live job lands after the first launch and before the remaining three,
+    # not after the whole file.
+    assert order[0] == "bulk"
+    assert order[1] == "interactive"
+    assert order.count("bulk") == 4
+
+def test_engine_starts_a_core_when_loaded():
+    """Loading the model always creates the model thread, batching or not."""
+    engine = _engine()
+    engine._asr = _StubAsr()
+    # ``load`` returns the cached model without touching torch.
+    engine.load()
+    try:
+        assert engine._core is not None
+        assert engine._core.started
+    finally:
+        engine.close()
+
+def test_transcribe_runs_through_the_core_without_a_lock():
+    engine = _engine()
     stub = _StubAsr()
     engine._asr = stub
-    engine._start_batcher()
-    assert engine._batcher is None
-    engine.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32))
-    assert len(stub.run_calls) == 1
+    engine._start_core()
+    try:
+        engine.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32))
+        assert len(stub.run_calls) == 1
+        assert engine.metrics()["core"]["batches_run"] == 1
+    finally:
+        engine.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -823,6 +1104,24 @@ def test_missing_file_is_an_openai_error(client):
     response = client.post("/v1/audio/transcriptions", data={"model": "x"})
     assert response.status_code == 400
     assert "error" in response.json()
+
+def test_busy_engine_returns_503(client):
+    """Backpressure surfaces as a retryable 503, not a hang."""
+    from app import server
+    from app.engine import EngineBusy
+
+    class BusyEngine(FakeEngine):
+        def transcribe(self, wav, **kwargs):
+            raise EngineBusy("the decode queue is full; retry once the backlog clears")
+
+    original = server.engine
+    server.engine = BusyEngine()
+    try:
+        response = _upload(client)
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "server_busy"
+    finally:
+        server.engine = original
 
 
 def test_unknown_route_uses_the_error_envelope(client):

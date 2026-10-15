@@ -53,7 +53,7 @@ from .audio import (
     to_16k_mono,
 )
 from .config import Settings
-from .engine import EngineNotReady, StreamEvent, TranscriptionEngine
+from .engine import EngineBusy, EngineNotReady, StreamEvent, TranscriptionEngine
 from .formats import MEDIA_TYPES, merge_segments_by_sentence, render
 from .schemas import APIError, TranscriptionParams, parse_transcription_form
 from .ui import INDEX_HTML
@@ -349,6 +349,15 @@ async def transcribe(
             use_lm=params.use_lm,
             beam_width=params.beam_width,
         )
+    except EngineBusy as exc:
+        # The decode queue is full. Refusing fast is the point of backpressure:
+        # a 503 the client can retry beats a request that hangs for minutes.
+        raise APIError(
+            str(exc),
+            status_code=503,
+            code="server_busy",
+            error_type="server_error",
+        ) from exc
     except EngineNotReady as exc:
         raise APIError(str(exc), status_code=503, error_type="server_error") from exc
 
@@ -675,7 +684,24 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                     np.float32
                 )
 
-            events = await run_in_threadpool(live.accept, samples)
+            try:
+                events = await run_in_threadpool(live.accept, samples)
+            except EngineBusy:
+                # The engine shed this step. LiveStream kept the audio, so the
+                # next frame retries it; tell the client it was throttled rather
+                # than dropping a chunk of speech silently.
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "error": {
+                            "message": "the server is busy; audio was buffered, "
+                            "slow the stream down",
+                            "type": "server_error",
+                            "code": "server_busy",
+                        },
+                    }
+                )
+                continue
             for event in events:
                 await websocket.send_json(_event_payload(event))
 

@@ -87,6 +87,10 @@ class StubEngine:
             "left_chunks": self.settings.left_chunks,
             "microbatch_seconds": self.settings.microbatch_seconds,
             "microbatch_max_requests": self.settings.microbatch_max_requests,
+            "microbatch_max_wait_ms": self.settings.microbatch_max_wait_ms,
+            "max_queue": self.settings.max_queue,
+            "max_interactive": self.settings.max_interactive,
+            "subbatch_seconds": self.settings.subbatch_seconds,
             "tf32": self.settings.tf32,
             "load_error": None,
             "load_seconds": 0.0,
@@ -97,7 +101,7 @@ class StubEngine:
         return {
             "requests_total": self.requests,
             "loaded": True,
-            "batcher": None,
+            "core": None,
         }
 
     def transcribe(self, wav, **kwargs):

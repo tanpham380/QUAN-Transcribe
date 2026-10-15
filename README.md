@@ -239,6 +239,7 @@ environment.
 | `LEFT_CHUNKS` | all | Streaming lookback; `0` = lowest latency |
 | `CHUNK_SECONDS` | `30.0` | Max seconds per decoded piece |
 | `BATCH_SECONDS` | `600.0` | Padding budget per forward pass; lower it if VRAM is tight |
+| `SUBBATCH_SECONDS` | `0` (off) | Hard cap on one forward pass, in audio seconds. Bounds how long a live step can wait behind a file; see [Performance](#performance). CPU profiles ship `30` |
 
 ### Throughput
 
@@ -247,9 +248,11 @@ more than one client at a time. See [Performance](#performance).
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `MICROBATCH_SECONDS` | `0.15` | Overlap required before concurrent requests share a forward pass; `0` disables cross-request batching |
-| `MICROBATCH_MAX_WAIT_MS` | `20.0` | How long a request waits for companions before its batch launches |
+| `MICROBATCH_SECONDS` | `0.15` | Coalescing window: how long pieces wait for companions before a forward pass; `0` batches only what is already queued |
+| `MICROBATCH_MAX_WAIT_MS` | `20.0` | Hard cap on that wait, in ms |
 | `MICROBATCH_MAX_REQUESTS` | `8` | Cap on requests packed into one batch |
+| `MAX_QUEUE` | `256` | Backpressure: most audio pieces that may wait to decode; a full queue returns `503`. `0` is unbounded |
+| `MAX_INTERACTIVE` | `64` | Backpressure: most streaming jobs in flight; `0` is unbounded |
 | `TF32` | `true` | Allow TF32 matmuls on Ampere+ (CUDA only); `false` for exact FP32 |
 | `CPU_THREADS` | auto | torch thread count for the CPU profile; set it when the container has a cgroup quota |
 
@@ -279,30 +282,61 @@ flapping during a multi-minute first start.
 ## Performance
 
 QUAN-Transcribe is a CTC model: one forward pass per piece of audio, no
-autoregressive loop. That makes the useful optimisation different from an LLM
-server's, and there are four levers, in rough order of impact.
+autoregressive loop and no KV cache. So the useful optimisation is different
+from an LLM server's, and there are four levers, in rough order of impact.
 
-### 1. Cross-request batching (the default)
+### 1. The engine core: one owner, priority, coalescing, backpressure
 
-A forward pass pads every piece of audio in it to the longest piece, so
-batching *k* pieces of up to *n* samples costs `k * n`. Upstream the batching is
-within one request: a 10-minute file becomes ~20 pieces that share passes. Two
-requests arriving at the same time, though, each launch their own passes.
+The model is not re-entrant, so exactly one thread may touch it at a time. That
+thread is the *engine core* (`app/core.py`); every request, streaming or batch,
+goes through it. One owner is what makes the rest possible:
 
-This server widens that window across requests (`app/batch.py`). A collector
-thread gathers pieces from concurrent requests for `MICROBATCH_MAX_WAIT_MS`,
-groups them by decode signature, sorts ascending by length, and greedily packs
-them under the same padded-cost budget the library uses. Encoding is where
-almost all the compute goes, and it is a pure GEMM pipeline, so packing more
-work into one launch is close to free throughput.
+- **A forward pass pads every piece of audio in it to the longest piece**, so
+  batching *k* pieces of up to *n* samples costs `k * n`. The core gathers
+  pieces from concurrent requests for up to `MICROBATCH_MAX_WAIT_MS`, groups
+  them by decode signature, sorts ascending by length, and greedily packs them
+  under the same padded-cost budget the library uses. Encoding is where almost
+  all the compute goes and it is a pure GEMM pipeline, so packing more work into
+  one launch is close to free throughput: two concurrent requests share one pass
+  instead of paying for two.
+- **Interactive work outranks bulk work.** A microphone step (`LiveSession`, the
+  WebSocket, an SSE stream) is submitted as *interactive*; a file upload is
+  *bulk*. Interactive jobs run immediately, never wait out a gather window, and
+  preempt a bulk request's remaining sub-batches. A 0.48 s live step can no
+  longer queue behind a ten-minute file.
+- **A forward pass is bounded.** Preemption only helps *between* launches, so
+  without a cap a single big file is one uninterruptible pass and the promise
+  above is empty. `SUBBATCH_SECONDS` caps one pass at that many audio seconds
+  (the padded cost `k * n`), turning a long file into several launches the
+  scheduler can preempt between. Without it, a live step's worst-case wait is
+  the whole file; with `SUBBATCH_SECONDS=10` it becomes about one chunk's
+  compute (measured on CPU: a live step behind a 120 s file went from ~18 s to
+  ~3.6 s with `CHUNK_SECONDS=10`). `0` keeps `BATCH_SECONDS` as the only bound.
+- **Backpressure is real.** `MAX_QUEUE` bounds the number of pieces waiting to
+  decode. When it is full, new uploads get a `503` (`"code": "server_busy"`)
+  instead of parking another thread, so saturation shows up as a fast, retryable
+  refusal rather than latency that grows without bound. Set `MAX_QUEUE=0` to
+  disable the cap.
 
-The cost is up to `MICROBATCH_MAX_WAIT_MS` of added latency, and only on the
-first piece of a request. Set `MICROBATCH_SECONDS=0` to turn it off entirely and
-get the plain per-request path; set `MICROBATCH_MAX_WAIT_MS=0` to batch only
+The cost of coalescing is up to `MICROBATCH_MAX_WAIT_MS` of added latency, and
+only on the first piece of a request. Set `MICROBATCH_SECONDS=0` to batch only
 what happens to already be queued (no added latency at all, still helps under
-load). Pieces with different decode signatures — streaming vs not, different
+load).
+
+Pieces with different decode signatures — streaming vs not, a different
 `left_chunks`, greedy vs beam search — are never mixed, because they need
 different model behaviour.
+
+> This is deliberately *not* an LLM-style continuous-batching scheduler. vLLM
+> schedules tokens across steps with a KV cache; a CTC forward pass has neither,
+> so there is nothing to interleave within a piece. The only reuse available is
+> putting whole pieces into one padded pass, which is exactly what the bulk path
+> does.
+
+`GET /metrics` reports the scheduler under `core`: `batches_run`, `pieces_run`,
+`jobs_run`, `queued_pieces`, `queued_interactive`, `shed`, `avg_batch_size` and
+`p50_latency_ms` / `p95_latency_ms` — the direct way to see whether coalescing
+is working and whether you are shedding load.
 
 Try `MICROBATCH_SECONDS=0` first if you serve one client at a time.
 
@@ -334,15 +368,26 @@ GEMM pipeline that scales with cores and with batch width:
 - `CPU_THREADS` sets the torch thread count. Leave it unset to let torch size
   itself to the visible cores; set it to the container's quota when it is
   cgroup-limited, or the threads will oversubscribe and thrash.
-- Widening the batch window helps more than it does on GPU
-  (`MICROBATCH_SECONDS=0.25`, `MICROBATCH_MAX_WAIT_MS=50` are the shipped CPU
-  values).
 - bf16 autocast does not apply on CPU, so the CUDA speedups above do not carry
-  over. Expect realtime-factor numbers in the single digits, not thousands.
+  over. Expect realtime-factor numbers in the tens, not thousands.
 
-`GET /metrics` reports `realtime_factor` and, under `batcher`, how many batches
-and pieces have run — the direct way to see whether batching is actually
-coalescing your traffic.
+Measured on an 8-core Apple laptop (Docker, 8 threads), 30 s of audio:
+
+| Path | Time | Notes |
+| --- | --- | --- |
+| Offline transcribe | ~2.5–3.1 s | RTF ≈ 0.10, ≈ 10× realtime |
+| SSE replay of the same file | ~27 s | re-decodes the utterance every 0.48 s step — inherent to the streaming decoder, not this server |
+| 4 concurrent files (120 s audio) | ~11.8 s | one shared forward pass (`batches_run` +1 for 4 requests), but near-neutral in wall time: torch already saturates every core per launch |
+
+The last row is the CPU-specific finding: **coalescing is nearly free on GPU
+(idle SM time) but nearly worthless on CPU**, where the cores are the
+bottleneck. CPU coalescing's real value is scheduling — it is what lets a live
+step preempt a file — so on CPU set `SUBBATCH_SECONDS` and a small
+`CHUNK_SECONDS` rather than chasing throughput with a wide batch window.
+
+`GET /metrics` reports `realtime_factor` and, under `core`, everything the
+scheduler saw. A quick health check: under steady concurrent load, `batches_run`
+should be well below `jobs_run`, and `shed` should stay at zero.
 
 ## Docker
 
@@ -437,7 +482,7 @@ There is no deploy stage: GPUStack pulls the image itself when you deploy.
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[test]"
 
-pytest -q                     # ~88 tests, no GPU or model download needed
+pytest -q                     # ~94 tests, no GPU or model download needed
 ruff check app tests scripts
 ruff format app tests scripts
 ```
@@ -450,10 +495,13 @@ To drive the real endpoints without downloading 356M parameters:
 ```bash
 python scripts/dev_server.py --port 8123   # stub engine, real ASGI stack
 ./scripts/smoke.sh http://127.0.0.1:8123   # curl through every response format
+python scripts/ws_probe.py --url ws://127.0.0.1:8123/v1/audio/transcriptions/stream
 ```
 
 `scripts/make_sample_audio.py` writes a small tone/quiet WAV if you need a
-fixture.
+fixture. `scripts/ws_probe.py` streams that kind of audio over the live
+WebSocket and prints every event; it needs `websockets`, which `uvicorn[standard]`
+already pulls in.
 
 ### Layout
 
@@ -461,17 +509,20 @@ fixture.
 app/config.py     settings, all env-driven
 app/audio.py      decode, resample, quiet-point splitting, segments
 app/formats.py    json/text/srt/vtt/verbose_json rendering
-app/batch.py      cross-request micro-batching of decode pieces
-app/engine.py     thread-safe model wrapper, streaming and live sessions
+app/core.py       the engine core: model-owning thread, priority + coalescing
+app/engine.py     model wrapper, streaming, live sessions, scheduler wiring
 app/schemas.py    request validation, OpenAI-shaped errors
 app/server.py     FastAPI routes, SSE, WebSocket
 app/ui.py         browser playground
 app/cli.py        `quan-asr` entrypoint
 ```
 
-Model calls are serialized behind a lock, and loading happens behind its own
-lock so concurrent first requests cannot race. A load failure does not kill the
-container — it surfaces through `/health` as `"error"`.
+Every model call goes through `app/core.py`, a single thread that owns the
+model: interactive (streaming) work preempts bulk (file) work, near-simultaneous
+bulk pieces are coalesced into one padded forward pass, and a bounded queue
+sheds load with a `503` rather than growing latency. Loading happens behind its
+own lock so concurrent first requests cannot race, and a load failure does not
+kill the container — it surfaces through `/health` as `"error"`.
 
 ## Credits
 

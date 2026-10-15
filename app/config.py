@@ -90,6 +90,14 @@ class Settings:
     chunk_seconds: float = 30.0
     #: Padding budget per forward pass; lower it if you run out of VRAM.
     batch_seconds: float = 600.0
+    #: Longest single forward pass, in audio seconds (the padded cost `k * n`).
+    #: A large file becomes several launches, and the scheduler can serve a
+    #: live request *between* them; without a cap one big file is one
+    #: uninterruptible pass. ``0`` keeps `batch_seconds` as the only bound.
+    #: On CPU batching is near-neutral for throughput (torch already uses every
+    #: core per op) but a long pass visibly stalls live audio, so the CPU
+    #: profiles set this; on GPU one 30 s piece is a few ms, so it can stay off.
+    subbatch_seconds: float = 0.0
     #: Overlap (seconds) required between two concurrent requests before they are
     #: merged into one padded forward pass. Padding every piece in a batch to the
     #: longest one only pays off when the extra compute is less than the time a
@@ -101,6 +109,12 @@ class Settings:
     microbatch_max_wait_ms: float = 20.0
     #: Up to this many concurrent requests' pieces are packed into one batch.
     microbatch_max_requests: int = 8
+    #: Backpressure for the decode queue: the most audio pieces that may be
+    #: waiting at once. When full, new bulk requests are refused with a 503
+    #: instead of piling up latency. ``0`` disables the cap (unbounded).
+    max_queue: int = 256
+    #: Backpressure for interactive (streaming) jobs. ``0`` disables the cap.
+    max_interactive: int = 64
     #: Allow TF32 matmuls on Ampere and later. Faster, with a small precision
     #: cost that a CTC model tolerates. Set false for bit-exact FP32 math.
     tf32: bool = True
@@ -141,6 +155,17 @@ class Settings:
         return "none (greedy decoding)"
 
     @property
+    def batching_summary(self) -> str:
+        """A one-line description of the scheduler settings, for the startup log."""
+        if self.microbatch_seconds <= 0:
+            return "interactive priority, coalescing off"
+        queue = "unbounded" if not self.max_queue else f"cap {self.max_queue}"
+        return (
+            f"coalescing window {self.microbatch_max_wait_ms:.0f}ms, "
+            f"max_requests {self.microbatch_max_requests}, queue {queue}"
+        )
+
+    @property
     def profile(self) -> str:
         """The hardware profile this configuration looks tuned for.
 
@@ -174,11 +199,14 @@ class Settings:
             left_chunks=_maybe_int("LEFT_CHUNKS"),
             chunk_seconds=_maybe_float("CHUNK_SECONDS", 30.0) or 30.0,
             batch_seconds=_maybe_float("BATCH_SECONDS", 600.0) or 600.0,
+            subbatch_seconds=_maybe_float("SUBBATCH_SECONDS", 0.0) or 0.0,
             microbatch_seconds=_maybe_float("MICROBATCH_SECONDS", 0.15) or 0.0,
             # ``or 20.0`` would swallow a deliberate 0 (batching without wait),
             # so the wait uses the raw parsed value.
             microbatch_max_wait_ms=_maybe_float("MICROBATCH_MAX_WAIT_MS", 20.0),
             microbatch_max_requests=_maybe_int("MICROBATCH_MAX_REQUESTS", 8) or 1,
+            max_queue=_maybe_int("MAX_QUEUE", 256) or 0,
+            max_interactive=_maybe_int("MAX_INTERACTIVE", 64) or 0,
             tf32=_flag("TF32", True),
             cpu_threads=_maybe_int("CPU_THREADS"),
             endpoint_s=_maybe_float("ENDPOINT_SECONDS", 0.8) or 0.8,

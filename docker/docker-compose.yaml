@@ -69,10 +69,19 @@ services:
       <<: *common-env
       # Pin the device so a host that happens to expose a GPU still runs here.
       DEVICE: cpu
-      # CPU decoding is one FP32 GEMM pipeline per core, so batching pays off
-      # with a wider gather window than the GPU default.
+      # CPU decoding is one FP32 GEMM pipeline per core, so coalescing buys
+      # little throughput here (the cores are the bottleneck). Keep the window
+      # short: it mainly saves a launch, not compute.
       MICROBATCH_SECONDS: ${MICROBATCH_SECONDS:-0.25}
-      MICROBATCH_MAX_WAIT_MS: ${MICROBATCH_MAX_WAIT_MS:-50}
+      MICROBATCH_MAX_WAIT_MS: ${MICROBATCH_MAX_WAIT_MS:-10}
+      # Bounded decode queue: a full queue returns 503 instead of growing
+      # latency without limit. 0 disables the cap.
+      MAX_QUEUE: ${MAX_QUEUE:-256}
+      # Cap each forward pass at 30 s of audio. On CPU one launch owns every
+      # core for its whole duration, so without this a long file would stall a
+      # live session until it finished; the cap gives the scheduler a point to
+      # preempt at. 0 disables it (fine on GPU, where a pass is milliseconds).
+      SUBBATCH_SECONDS: ${SUBBATCH_SECONDS:-30}
       # Unset lets torch size itself to the visible cores. Set it when the
       # container is limited by a cgroup quota, e.g. CPU_THREADS=4.
       CPU_THREADS: ${CPU_THREADS:-}

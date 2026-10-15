@@ -65,10 +65,16 @@ version_configs:
     # have a GPU is still driven on the CPU when this version is chosen.
     env:
       DEVICE: cpu
-      # CPU decoding is one FP32 GEMM pipeline per core, so batching is worth a
-      # wider gather window than the GPU default.
+      # CPU decoding is one FP32 GEMM pipeline per core, so coalescing buys
+      # little throughput; keep the gather window short.
       MICROBATCH_SECONDS: "0.25"
-      MICROBATCH_MAX_WAIT_MS: "50"
+      MICROBATCH_MAX_WAIT_MS: "10"
+      # Bounded decode queue: a full queue returns 503 instead of growing
+      # latency without limit. 0 disables the cap.
+      MAX_QUEUE: "256"
+      # Cap each forward pass at 30 s of audio so a long file cannot stall a
+      # live session: the scheduler can preempt between launches.
+      SUBBATCH_SECONDS: "30"
       # Leave CPU_THREADS unset to let torch size itself to the visible cores;
       # set it when the container is limited by a cgroup quota, e.g. "4".
       # CPU_THREADS: "4"
