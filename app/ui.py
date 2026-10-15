@@ -1599,32 +1599,119 @@ advancedToggle.onclick = () => {
   advancedIcon.textContent = isExpanded ? 'expand_less' : 'expand_more';
 };
 
+// ================= STATE & READINESS =================
+let isModelReady = false;
+let healthTimer = null;
+
+function updateUiReadiness(ready, loading, error, device) {
+  const pill = $('healthPill');
+  const text = $('healthText');
+  const loadBanner = $('modelLoadingBanner');
+  const errBanner = $('modelErrorBanner');
+  const errDetails = $('bannerErrorDetails');
+  const micBtn = $('micBtn');
+  const sampleChips = document.querySelectorAll('.sample-chip');
+
+  if (ready) {
+    if (!isModelReady) {
+      isModelReady = true;
+      showToast('Mô hình QUAN-Transcribe-1.0 đã sẵn sàng phục vụ!');
+    }
+    pill.className = 'badge status-ready';
+    text.textContent = `Sẵn sàng (${device || 'GPU/MPS'})`;
+    $('metricDevice').textContent = device || 'Đang xác định';
+
+    if (loadBanner) loadBanner.style.display = 'none';
+    if (errBanner) errBanner.style.display = 'none';
+
+    // Enable buttons if audio file selected
+    if (currentFile) {
+      btnTranscribe.disabled = false;
+      btnStream.disabled = false;
+    }
+    btnTranscribe.innerHTML = '<span class="icon">play_arrow</span> Bắt đầu nhận diện';
+    btnStream.innerHTML = '<span class="icon">stream</span> Phát trực tiếp (SSE)';
+
+    micBtn.classList.remove('disabled-loading');
+    micBtn.title = 'Nhấn vào biểu tượng Micro để nói tiếng Việt trực tiếp';
+    sampleChips.forEach(c => c.classList.remove('disabled-loading'));
+
+  } else if (error) {
+    isModelReady = false;
+    pill.className = 'badge status-error';
+    text.textContent = 'Lỗi mô hình';
+    $('metricDevice').textContent = device || 'Lỗi';
+
+    if (loadBanner) loadBanner.style.display = 'none';
+    if (errBanner) {
+      errBanner.style.display = 'block';
+      if (errDetails) errDetails.textContent = error;
+    }
+
+    btnTranscribe.disabled = true;
+    btnStream.disabled = true;
+    btnTranscribe.innerHTML = '<span class="icon">error</span> Mô hình bị lỗi';
+    btnStream.innerHTML = '<span class="icon">error</span> Mô hình bị lỗi';
+    micBtn.classList.add('disabled-loading');
+    micBtn.title = 'Mô hình gặp lỗi khởi tạo';
+    sampleChips.forEach(c => c.classList.add('disabled-loading'));
+
+  } else {
+    // Loading state
+    isModelReady = false;
+    pill.className = 'badge status-loading';
+    text.textContent = 'Đang nạp mô hình...';
+    $('metricDevice').textContent = device || 'Đang tải weights';
+
+    if (loadBanner) loadBanner.style.display = 'block';
+    if (errBanner) errBanner.style.display = 'none';
+
+    btnTranscribe.disabled = true;
+    btnStream.disabled = true;
+    btnTranscribe.innerHTML = '<span class="icon spin">sync</span> Đang nạp mô hình...';
+    btnStream.innerHTML = '<span class="icon spin">sync</span> Đang nạp mô hình...';
+
+    micBtn.classList.add('disabled-loading');
+    micBtn.title = 'Mô hình đang tải weights (~1.4 GB), vui lòng đợi...';
+    sampleChips.forEach(c => c.classList.add('disabled-loading'));
+  }
+}
+
 // ================= HEALTH & METRICS POLLING =================
 async function refreshHealth() {
   try {
     const res = await fetch('/health');
     const data = await res.json();
-    const pill = $('healthPill');
-    const text = $('healthText');
+    const isReady = Boolean(data.ready !== undefined ? data.ready : data.loaded);
+    const isLoading = Boolean(data.loading || data.status === 'loading' || (!data.loaded && !data.error));
+    updateUiReadiness(isReady, isLoading, data.error, data.device);
 
-    if (data.loaded) {
-      pill.className = 'badge status-ready';
-      text.textContent = `Sẵn sàng (${data.device || 'GPU/MPS'})`;
-      $('metricDevice').textContent = data.device || 'Đang xác định';
-    } else if (data.status === 'loading') {
-      pill.className = 'badge status-loading';
-      text.textContent = 'Đang nạp mô hình...';
-    } else {
-      pill.className = 'badge status-error';
-      text.textContent = data.error || 'Lỗi mô hình';
+    if (data.lm !== undefined) {
+      const lmCheck = $('useLmCheck');
+      if (lmCheck) {
+        if (!data.lm) {
+          lmCheck.checked = false;
+          lmCheck.disabled = true;
+          const labelSpan = lmCheck.closest('label')?.querySelector('span');
+          if (labelSpan) labelSpan.textContent = 'Sử dụng KenLM Beam Search (Chưa kích hoạt USE_LM)';
+        } else {
+          lmCheck.disabled = false;
+          const labelSpan = lmCheck.closest('label')?.querySelector('span');
+          if (labelSpan) labelSpan.textContent = 'Sử dụng KenLM Beam Search (Language Model)';
+        }
+      }
     }
+
+    clearTimeout(healthTimer);
+    healthTimer = setTimeout(refreshHealth, isReady ? 5000 : 1500);
   } catch (err) {
     $('healthPill').className = 'badge status-error';
     $('healthText').textContent = 'Ngoại tuyến (Offline)';
+    clearTimeout(healthTimer);
+    healthTimer = setTimeout(refreshHealth, 3000);
   }
 }
 refreshHealth();
-setInterval(refreshHealth, 5000);
 
 async function refreshMetrics() {
   try {
@@ -1632,34 +1719,72 @@ async function refreshMetrics() {
     const data = await res.json();
     $('rawMetricsJson').textContent = JSON.stringify(data, null, 2);
 
-    if (data.rtf !== undefined) {
-      $('metricRtf').textContent = `${(data.rtf || 0).toFixed(1)}x`;
+    // 1. Realtime Factor (RTF)
+    const rtf = (data.realtime_factor !== undefined && data.realtime_factor !== null)
+      ? data.realtime_factor
+      : (data.rtf !== undefined ? data.rtf : null);
+    if (rtf !== null && rtf !== undefined && rtf > 0) {
+      const speed = (1 / rtf).toFixed(1);
+      $('metricRtf').textContent = `${rtf.toFixed(2)}x (${speed}x realtime)`;
+    } else {
+      $('metricRtf').textContent = '—';
     }
-    if (data.total_audio_seconds !== undefined) {
-      const mins = (data.total_audio_seconds / 60).toFixed(1);
-      $('metricTotalAudio').textContent = `${mins} phút (${data.total_audio_seconds.toFixed(0)}s)`;
+
+    // 2. Total Audio Seconds
+    const totalSec = data.audio_seconds_total !== undefined
+      ? data.audio_seconds_total
+      : (data.total_audio_seconds !== undefined ? data.total_audio_seconds : 0);
+    if (totalSec > 0) {
+      const mins = (totalSec / 60).toFixed(1);
+      $('metricTotalAudio').textContent = `${mins} phút (${totalSec.toFixed(1)}s)`;
+    } else {
+      $('metricTotalAudio').textContent = '0s';
     }
-    if (data.requests_total !== undefined) {
-      const ok = data.requests_success || 0;
-      const fail = data.requests_failed || 0;
-      $('metricRequests').textContent = `${ok} / ${fail}`;
+
+    // 3. Requests Total (Success / Failed)
+    const reqTotal = data.requests_total !== undefined ? data.requests_total : (data.requests || 0);
+    const reqOk = data.requests_success !== undefined ? data.requests_success : reqTotal;
+    const reqFail = data.requests_failed || 0;
+    if (reqTotal > 0) {
+      $('metricRequests').textContent = `${reqTotal} (${reqOk} OK / ${reqFail} lỗi)`;
+    } else {
+      $('metricRequests').textContent = '0 yêu cầu';
     }
+
+    // 4. Device
     if (data.device) {
       $('metricDevice').textContent = data.device;
     }
+
+    // 5. Model Info
     if (data.model) {
       $('mInfoName').textContent = data.model;
     }
-    $('mInfoLm').textContent = data.supports_lm ? 'Có (KenLM)' : 'Không (Greedy CTC)';
-    $('mInfoQueue').textContent = data.queue_size !== undefined ? `${data.queue_size} tasks` : '0';
-    $('mInfoStreams').textContent = data.active_streams !== undefined ? data.active_streams : '0';
+    const hasLm = data.lm !== undefined ? data.lm : data.supports_lm;
+    $('mInfoLm').textContent = hasLm ? 'Có (KenLM Beam Search)' : 'Không (Greedy CTC)';
+
+    // 6. Queue & Batches
+    if (data.core) {
+      const queued = data.core.queued_pieces !== undefined ? data.core.queued_pieces : 0;
+      const maxQ = data.max_queue || 256;
+      const jobs = data.core.jobs_run !== undefined ? data.core.jobs_run : 0;
+      $('mInfoQueue').textContent = `${queued} / ${maxQ} đoạn (Đã chạy: ${jobs} jobs)`;
+    } else {
+      $('mInfoQueue').textContent = '0 đoạn';
+    }
+
+    // 7. Active Streams
+    const streams = data.active_streams !== undefined ? data.active_streams : 0;
+    const batches = data.core && data.core.batches_run !== undefined ? ` · ${data.core.batches_run} batches` : '';
+    $('mInfoStreams').textContent = `${streams} kết nối${batches}`;
+
   } catch (err) {
     $('rawMetricsJson').textContent = 'Không thể tải chỉ số metrics: ' + err;
   }
 }
 $('btnRefreshMetrics').onclick = refreshMetrics;
 refreshMetrics();
-setInterval(refreshMetrics, 4000);
+setInterval(refreshMetrics, 3000);
 
 // ================= FILE UPLOAD & TRANSCRIPTION =================
 const dropzone = $('dropzone');
@@ -1683,9 +1808,15 @@ function setFile(file) {
   selectedFileSize.textContent = `${(file.size / (1024 * 1024)).toFixed(2)} MB`;
   audioPlayer.src = URL.createObjectURL(file);
   audioPreviewBox.className = 'audio-preview-box has-file';
-  btnTranscribe.disabled = false;
-  btnStream.disabled = false;
-  showToast(`Đã chọn tệp: ${file.name}`);
+  if (isModelReady) {
+    btnTranscribe.disabled = false;
+    btnStream.disabled = false;
+    showToast(`Đã chọn tệp: ${file.name}`);
+  } else {
+    btnTranscribe.disabled = true;
+    btnStream.disabled = true;
+    showToast(`Đã chọn tệp: ${file.name}. Nút nhận diện sẽ mở ngay khi mô hình nạp xong!`, true);
+  }
 }
 
 dropzone.onclick = () => fileInput.click();
@@ -1803,6 +1934,10 @@ function displayResult(text, format, elapsed = 0) {
 
 // 1. Batch Transcribe Action
 btnTranscribe.onclick = async () => {
+  if (!isModelReady) {
+    showToast('Mô hình đang nạp trọng số (~1.4 GB), vui lòng đợi trong giây lát!', true);
+    return;
+  }
   if (!currentFile) return;
   const format = $('formatSelect').value;
   const formData = new FormData();
@@ -1833,6 +1968,7 @@ btnTranscribe.onclick = async () => {
       chip.textContent = `Thành công (${elapsed.toFixed(2)}s)`;
       displayResult(text, format, elapsed);
       showToast('Đã nhận diện thành công!');
+      refreshMetrics();
     } else {
       chip.className = 'badge status-error';
       chip.textContent = `Lỗi ${res.status}`;
@@ -1852,6 +1988,10 @@ btnTranscribe.onclick = async () => {
 
 // 2. Real-time SSE Stream Action
 btnStream.onclick = async () => {
+  if (!isModelReady) {
+    showToast('Mô hình đang nạp trọng số (~1.4 GB), vui lòng đợi trong giây lát!', true);
+    return;
+  }
   if (!currentFile) return;
   const formData = new FormData();
   formData.append('file', currentFile);
@@ -1912,6 +2052,7 @@ btnStream.onclick = async () => {
         } else if (payload.type === 'transcript.text.done' || payload.type === 'transcript.text.completed') {
           const finalFull = payload.text || confirmedSegments.join(' ');
           displayResult(finalFull, 'text', payload.elapsed || ((performance.now() - t0) / 1000));
+          refreshMetrics();
         } else if (payload.type === 'error') {
           showToast('Lỗi SSE: ' + payload.error.message, true);
         }
@@ -2140,6 +2281,10 @@ function stopMic() {
 }
 
 micBtn.onclick = () => {
+  if (!isModelReady) {
+    showToast('Mô hình đang nạp trọng số (~1.4 GB), vui lòng đợi trong giây lát!', true);
+    return;
+  }
   if (!isRecording) startMic();
   else stopMic();
 };

@@ -68,6 +68,7 @@ engine = TranscriptionEngine(settings)
 
 #: Extra model names OpenAI clients tend to send.
 _ALIASES = {"whisper-1", "quan-transcribe", "quan-transcribe-1.0", "quan-asr", "quan-asr-server"}
+_active_websockets = 0
 
 
 # --------------------------------------------------------------------------- #
@@ -337,23 +338,23 @@ async def get_sample(filename: str) -> FileResponse:
 
 @app.get("/health")
 async def health(response: Response, ready: bool = False) -> dict[str, Any]:
-    info = engine.info()
-    loaded = bool(info["loaded"])
-    is_ready = bool(info.get("ready", loaded and not info.get("load_error")))
+    loaded = bool(engine.is_loaded)
+    err = engine.load_error
+    is_ready = loaded and not err
     # If caller specifically requested readiness check (e.g. ?ready=true) or there's a hard error:
-    if (not loaded and info["load_error"]) or (ready and not is_ready):
+    if (not loaded and err) or (ready and not is_ready):
         response.status_code = 503
     return {
-        "status": "ok" if is_ready else ("error" if info["load_error"] else "loading"),
-        "model": info["model"],
+        "status": "ok" if is_ready else ("error" if err else "loading"),
+        "model": settings.served_model_name,
         "device": (
             engine.describe_device() if loaded else (settings.device or "unknown")
         ),
         "language": "vi",
         "loaded": loaded,
-        "loading": bool(info.get("loading", False)),
+        "loading": bool(getattr(engine, "is_loading", False)),
         "ready": is_ready,
-        "error": info["load_error"],
+        "error": err,
     }
 
 
@@ -361,18 +362,18 @@ async def health(response: Response, ready: bool = False) -> dict[str, Any]:
 @app.get("/readyz", include_in_schema=False)
 async def ready_probe(response: Response) -> dict[str, Any]:
     """Readiness probe: returns 200 when model is loaded and ready, 503 when loading or failed."""
-    info = engine.info()
-    loaded = bool(info["loaded"])
-    is_ready = bool(info.get("ready", loaded and not info.get("load_error")))
+    loaded = bool(engine.is_loaded)
+    err = engine.load_error
+    is_ready = loaded and not err
     if not is_ready:
         response.status_code = 503
         return {
             "ready": False,
-            "status": "error" if info["load_error"] else "loading",
-            "error": info["load_error"],
+            "status": "error" if err else "loading",
+            "error": err,
             "message": (
-                f"model failed to load: {info['load_error']}"
-                if info["load_error"]
+                f"model failed to load: {err}"
+                if err
                 else f"model '{settings.served_model_name}' is currently loading weights"
             ),
         }
@@ -388,7 +389,12 @@ async def live_probe() -> dict[str, Any]:
 
 @app.get("/metrics")
 async def metrics() -> dict[str, Any]:
-    return {**engine.metrics(), **engine.info()}
+    base = {**engine.metrics(), **engine.info()}
+    base["active_streams"] = _active_websockets
+    base["queue_size"] = (
+        base.get("core", {}).get("queued_pieces", 0) if isinstance(base.get("core"), dict) else 0
+    )
+    return base
 
 
 @app.get("/v1/models")
@@ -782,6 +788,9 @@ async def transcribe_stream(websocket: WebSocket) -> None:
         await websocket.close(code=1011)
         return
 
+    global _active_websockets
+    _active_websockets += 1
+
     raw_punc = websocket.query_params.get("punctuate") or websocket.query_params.get("enable_punctuation")
     should_punctuate = (
         raw_punc.strip().lower() in ("1", "true", "yes", "on")
@@ -921,6 +930,7 @@ async def transcribe_stream(websocket: WebSocket) -> None:
     except Exception:
         logger.debug("websocket session ended early", exc_info=True)
     finally:
+        _active_websockets = max(0, _active_websockets - 1)
         await run_in_threadpool(live.close)
         with contextlib.suppress(RuntimeError):
             await websocket.close()

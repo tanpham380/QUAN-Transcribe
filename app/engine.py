@@ -73,6 +73,8 @@ class TranscriptionEngine:
         self._load_seconds: float | None = None
         self._loaded_at: float | None = None
         self.requests = 0
+        self.requests_success = 0
+        self.requests_failed = 0
         self.audio_seconds = 0.0
         self.decode_seconds = 0.0
         self._is_loading: bool = False
@@ -302,9 +304,13 @@ class TranscriptionEngine:
         core = self._core.stats() if self._core is not None else None
         return {
             "requests_total": self.requests,
+            "requests_success": self.requests_success,
+            "requests_failed": self.requests_failed,
             "audio_seconds_total": round(self.audio_seconds, 3),
+            "total_audio_seconds": round(self.audio_seconds, 3),
             "decode_seconds_total": round(self.decode_seconds, 3),
             "realtime_factor": round(rtf, 4) if rtf else None,
+            "rtf": round(rtf, 4) if rtf else None,
             "loaded": self.is_loaded,
             "core": core,
             "vad": self._vad.stats() if self._vad is not None else None,
@@ -604,10 +610,21 @@ class TranscriptionEngine:
 
     # -- bookkeeping ---------------------------------------------------------
 
-    def _record(self, audio_seconds: float, decode_seconds: float) -> None:
+    def _record(
+        self, audio_seconds: float, decode_seconds: float, success: bool = True
+    ) -> None:
         self.requests += 1
+        if success:
+            self.requests_success += 1
+        else:
+            self.requests_failed += 1
         self.audio_seconds += audio_seconds
         self.decode_seconds += decode_seconds
+
+    def record_failure(self) -> None:
+        """Record an error/failed request."""
+        self.requests += 1
+        self.requests_failed += 1
 
     def close(self) -> None:
         core, self._core = self._core, None

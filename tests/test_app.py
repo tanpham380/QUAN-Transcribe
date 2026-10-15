@@ -1014,7 +1014,11 @@ class FakeEngine:
 
     @property
     def is_loaded(self):
-        return True
+        return getattr(self, "_is_loaded", True)
+
+    @is_loaded.setter
+    def is_loaded(self, value):
+        self._is_loaded = bool(value)
 
     def load(self):
         return self
@@ -1143,7 +1147,45 @@ def test_health(client):
     body = client.get("/health").json()
     assert body["status"] == "ok"
     assert body["loaded"] is True
+    assert body["ready"] is True
     assert body["language"] == "vi"
+
+
+def test_ready_and_live_probes(client):
+    # When loaded, /ready, /readyz, /live, /livez should succeed
+    res_ready = client.get("/ready")
+    assert res_ready.status_code == 200
+    assert res_ready.json()["ready"] is True
+
+    res_live = client.get("/live")
+    assert res_live.status_code == 200
+    assert res_live.json()["live"] is True
+
+    # When engine is not loaded (e.g. downloading weights)
+    client.fake_engine.is_loaded = False
+    res_ready_loading = client.get("/ready")
+    assert res_ready_loading.status_code == 503
+    assert res_ready_loading.json()["ready"] is False
+    assert res_ready_loading.json()["status"] == "loading"
+
+    # Health with ?ready=true also returns 503 when not loaded
+    res_health_ready = client.get("/health?ready=true")
+    assert res_health_ready.status_code == 503
+
+    # Reset
+    client.fake_engine.is_loaded = True
+
+
+def test_transcribe_rejects_when_not_ready(client):
+    client.fake_engine.is_loaded = False
+    response = _upload(client)
+    assert response.status_code == 503
+    payload = response.json()
+    assert payload["error"]["code"] == "model_loading"
+    assert "loading weights" in payload["error"]["message"]
+
+    # Reset
+    client.fake_engine.is_loaded = True
 
 
 def test_metrics(client):
