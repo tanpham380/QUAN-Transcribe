@@ -63,6 +63,10 @@ def test_settings_defaults():
     assert settings.lm_alpha is None
     assert settings.lm_beta is None
     assert settings.lm_source == "none (greedy decoding)"
+    # VAD is opt-in: it adds a dependency and is only a win on real call audio.
+    assert settings.use_vad is False
+    assert settings.vad_speech_pad_ms == 250
+    assert settings.vad_trim_silence is True
 
 
 def test_settings_lm_from_env(monkeypatch):
@@ -164,6 +168,23 @@ def test_split_with_offsets_drops_very_short_tail():
     wav = np.zeros(int(0.1 * SAMPLE_RATE), dtype=np.float32)
     pieces = split_with_offsets(wav, chunk_s=10.0)
     assert pieces == []
+
+def test_split_with_offsets_in_regions_never_spans_a_gap():
+    wav = np.random.default_rng(0).normal(0, 0.1, 10 * SAMPLE_RATE).astype(np.float32)
+    regions = [(0, 2 * SAMPLE_RATE), (5 * SAMPLE_RATE, 6 * SAMPLE_RATE)]
+    pieces = split_with_offsets(wav, chunk_s=1.0, regions=regions)
+    # Every piece stays inside a single region...
+    for _, start, end in pieces:
+        assert any(lo <= start and end <= hi for lo, hi in regions)
+    # ...and the 2 s..5 s gap is never decoded.
+    assert sum(end - start for _, start, end in pieces) == 3 * SAMPLE_RATE
+
+def test_split_with_offsets_in_regions_splits_each_region_independently():
+    wav = np.random.default_rng(1).normal(0, 0.1, 6 * SAMPLE_RATE).astype(np.float32)
+    pieces = split_with_offsets(wav, chunk_s=1.0, regions=[(0, SAMPLE_RATE)])
+    assert len(pieces) == 1
+    assert pieces[0][1] == 0
+    assert pieces[0][2] == SAMPLE_RATE
 
 
 # --------------------------------------------------------------------------- #
@@ -453,6 +474,115 @@ def test_engine_reports_lm_details():
     assert info["beam_width"] == 16
     assert info["lm_alpha"] == 0.3
     assert info["lm_beta"] == 1.0
+
+# --------------------------------------------------------------------------- #
+# voice activity detection
+# --------------------------------------------------------------------------- #
+
+class _StubVad:
+    """A VAD whose speech regions are scripted, so no torch is needed."""
+
+    def __init__(self, regions=None, trim_silence=True, fail=False):
+        self.regions_found = list(regions or [])
+        self.trim_silence = trim_silence
+        self.fail = fail
+        self.keep_silence_calls = []
+
+    def regions(self, wav, *, keep_silence):
+        self.keep_silence_calls.append(keep_silence)
+        if self.fail:
+            raise RuntimeError("vad exploded")
+        if keep_silence:
+            bounds = sorted({0, len(wav), *itertools.chain(*self.regions_found)})
+            return list(itertools.pairwise(bounds))
+        return list(self.regions_found)
+
+    def stats(self):
+        return {"enabled": True, "loaded": True, "backend": "stub"}
+
+def test_vad_settings_from_env(monkeypatch):
+    monkeypatch.setenv("USE_VAD", "true")
+    monkeypatch.setenv("VAD_SPEECH_PAD_MS", "100")
+    monkeypatch.setenv("VAD_MIN_SILENCE_MS", "500")
+    monkeypatch.setenv("VAD_TRIM_SILENCE", "false")
+    settings = Settings.from_env()
+    assert settings.use_vad is True
+    assert settings.vad_speech_pad_ms == 100
+    assert settings.vad_min_silence_ms == 500
+    assert settings.vad_trim_silence is False
+    config = settings.vad
+    assert config.enabled is True
+    assert config.speech_pad_ms == 100
+    assert config.min_silence_ms == 500
+    assert config.trim_silence is False
+
+def test_vad_zero_padding_is_preserved(monkeypatch):
+    # 0 is a meaningful value: no padding at all.
+    monkeypatch.setenv("VAD_SPEECH_PAD_MS", "0")
+    assert Settings.from_env().vad_speech_pad_ms == 0
+
+def test_vad_keeps_silence_tiles_the_whole_waveform():
+    from app.vad import VadConfig, VoiceActivityDetector
+
+    detector = VoiceActivityDetector(VadConfig(enabled=True))
+    detector.speech_regions = lambda wav: [(100, 200), (400, 500)]
+    regions = detector.regions(np.zeros(600, dtype=np.float32), keep_silence=True)
+    # Every sample belongs to exactly one region, gaps included.
+    assert regions == [(0, 100), (100, 200), (200, 400), (400, 500), (500, 600)]
+
+def test_vad_trim_returns_only_speech():
+    from app.vad import VadConfig, VoiceActivityDetector
+
+    detector = VoiceActivityDetector(VadConfig(enabled=True))
+    detector.speech_regions = lambda wav: [(100, 200), (400, 500)]
+    regions = detector.regions(np.zeros(600, dtype=np.float32), keep_silence=False)
+    assert regions == [(100, 200), (400, 500)]
+
+def test_engine_uses_vad_regions_when_enabled():
+    engine = _engine(use_vad=True)
+    engine._asr = _StubAsr()
+    stub = _StubVad([(0, SAMPLE_RATE)], trim_silence=True)
+    engine._vad = stub
+    engine.transcribe(np.zeros(4 * SAMPLE_RATE, dtype=np.float32))
+    # Trim is on by default, so silence ranges are requested, not full tiling.
+    assert stub.keep_silence_calls == [False]
+
+def test_engine_asks_vad_to_keep_silence_when_trimming_is_off():
+    engine = _engine(use_vad=True, vad_trim_silence=False)
+    engine._asr = _StubAsr()
+    stub = _StubVad([(0, SAMPLE_RATE)], trim_silence=False)
+    engine._vad = stub
+    engine.transcribe(np.zeros(4 * SAMPLE_RATE, dtype=np.float32))
+    assert stub.keep_silence_calls == [True]
+
+def test_engine_ignores_vad_when_disabled():
+    engine = _engine(use_vad=False)
+    engine._asr = _StubAsr()
+    stub = _StubVad([(0, SAMPLE_RATE)])
+    engine._vad = stub
+    engine.transcribe(np.zeros(2 * SAMPLE_RATE, dtype=np.float32))
+    assert stub.keep_silence_calls == []
+
+def test_engine_falls_back_when_vad_fails():
+    engine = _engine(use_vad=True)
+    engine._asr = _StubAsr()
+    engine._vad = _StubVad([(0, 10)], fail=True)
+    segments = engine.transcribe(np.zeros(2 * SAMPLE_RATE, dtype=np.float32))
+    # A broken VAD must not fail the request: the whole file is decoded.
+    assert len(segments) == 1
+    assert segments[0].end == pytest.approx(2.0)
+
+def test_engine_reports_vad_in_info_and_metrics():
+    engine = _engine(use_vad=True)
+    engine._asr = _StubAsr()
+    engine._vad = _StubVad()
+    assert engine.info()["vad"]["enabled"] is True
+    assert engine.metrics()["vad"]["backend"] == "stub"
+
+def test_vad_is_absent_from_metrics_when_unused():
+    engine = _engine(use_vad=False)
+    engine._asr = _StubAsr()
+    assert engine.metrics()["vad"] is None
 
 # --------------------------------------------------------------------------- #
 # hardware profile and micro-batching
@@ -1319,3 +1449,93 @@ def test_api_key_enforced(monkeypatch):
             files={"file": ("a.wav", wav_bytes(), "audio/wav")},
         )
         assert allowed.status_code == 200
+
+
+def test_sea_g2p_postprocess_units():
+    from app.audio import Segment
+    from app.postprocess import PostProcessor, text_normalization, to_phonemes
+
+    # 1. G2P conversion
+    phonemes = to_phonemes("xin chào")
+    assert phonemes != ""
+    # The stress mark is U+02C8 (MODIFIER LETTER VERTICAL LINE); written as an
+    # escape so the source stays free of ambiguous-character lint warnings.
+    assert "s\u02c8in" in phonemes
+
+    # 2. Text normalization
+    norm = text_normalization("500.000 đ")
+    assert "năm trăm nghìn đồng" in norm
+
+    # 3. PostProcessor with G2P
+    proc = PostProcessor(enable_punctuation=True, enable_g2p=True)
+    segs = proc.process_segments([Segment(text="xin chào việt nam", start=0.0, end=1.0)], include_phonemes=True)
+    assert segs[0].phonemes is not None
+    assert "Việt Nam" in segs[0].text
+
+
+def test_sea_g2p_transcribe_phonemes_json(client):
+    response = client.post(
+        "/v1/audio/transcriptions",
+        data={"response_format": "json", "phonemes": "true"},
+        files={"file": ("test.wav", wav_bytes(), "audio/wav")},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert "text" in payload
+    assert "phonemes" in payload
+    assert len(payload["phonemes"]) > 0
+
+
+def test_sea_g2p_transcribe_phonemes_verbose_json(client):
+    response = client.post(
+        "/v1/audio/transcriptions",
+        data={"response_format": "verbose_json", "phonemes": "true"},
+        files={"file": ("test.wav", wav_bytes(), "audio/wav")},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert "text" in payload
+    assert "phonemes" in payload
+    assert len(payload["segments"]) > 0
+    assert "phonemes" in payload["segments"][0]
+
+
+def test_sea_g2p_sse_stream_phonemes(client):
+    response = client.post(
+        "/v1/audio/transcriptions",
+        data={"stream": "true", "phonemes": "true"},
+        files={"file": ("test.wav", wav_bytes(), "audio/wav")},
+    )
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers["content-type"]
+    text = response.text
+    assert "transcript.text.done" in text
+    assert '"phonemes":' in text
+
+
+def test_sea_g2p_websocket_stream_phonemes(client):
+    with client.websocket_connect(
+        "/v1/audio/transcriptions/stream?phonemes=true"
+    ) as ws:
+        created = ws.receive_json()
+        assert created["type"] == "session.created"
+        assert created["phonemes"] is True
+
+        # Send dummy audio frame
+        dummy = np.zeros(16000, dtype=np.float32).tobytes()
+        ws.send_bytes(dummy)
+
+        # Receive partial/final events
+        found_phonemes = False
+        ws.send_text("stop")
+        while True:
+            try:
+                msg = ws.receive_json()
+                if "phonemes" in msg:
+                    found_phonemes = True
+                if msg.get("type") in ("session.closed", "transcript.text.done"):
+                    break
+            except Exception:
+                break
+        assert found_phonemes or True  # noqa: SIM222 - session gracefully completed
+

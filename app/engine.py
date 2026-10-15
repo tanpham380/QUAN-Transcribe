@@ -27,6 +27,7 @@ import numpy as np
 from .audio import SAMPLE_RATE, Segment
 from .config import Settings
 from .core import EngineBusy, EngineCore
+from .vad import VoiceActivityDetector
 
 __all__ = [
     "EngineBusy",
@@ -78,6 +79,9 @@ class TranscriptionEngine:
         # sample-rate-derived budget can be trusted, and always present: even a
         # single request runs through it, so there is exactly one code path.
         self._core: EngineCore | None = None
+        # Voice activity detection runs on request threads, never the model
+        # thread, so it never blocks a decode. Created on first use.
+        self._vad: VoiceActivityDetector | None = None
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -270,6 +274,9 @@ class TranscriptionEngine:
             "max_interactive": self.settings.max_interactive,
             "subbatch_seconds": self.settings.subbatch_seconds,
             "tf32": self.settings.tf32,
+            "vad": self._vad.stats() if self._vad is not None else {
+                "enabled": self.settings.use_vad
+            },
             "load_error": self._load_error,
             "load_seconds": self._load_seconds,
             "loaded_at": self._loaded_at,
@@ -285,6 +292,7 @@ class TranscriptionEngine:
             "realtime_factor": round(rtf, 4) if rtf else None,
             "loaded": self.is_loaded,
             "core": core,
+            "vad": self._vad.stats() if self._vad is not None else None,
         }
 
     def describe_device(self) -> str:
@@ -376,6 +384,38 @@ class TranscriptionEngine:
         context = (bool(streaming), left_chunks, decoder, beam_width)
         return core.submit_bulk(pieces, signature, context)
 
+    def _vad_detector(self) -> VoiceActivityDetector | None:
+        """The shared VAD, or ``None`` when VAD is disabled.
+
+        Created once and reused so the Silero model is loaded a single time.
+        A load failure (the ``vad`` extra is not installed) is fatal here rather
+        than silent: it is a configuration error, and the caller catches it and
+        falls back to energy-based splitting for the request.
+        """
+        if not self.settings.use_vad:
+            return None
+        if self._vad is None:
+            self._vad = VoiceActivityDetector(self.settings.vad)
+        return self._vad
+
+    def _regions_for(self, wav: np.ndarray) -> list[tuple[int, int]] | None:
+        """VAD speech ranges to decode, or ``None`` to use the whole waveform.
+
+        ``None`` is returned both when VAD is off and when it fails, so a broken
+        VAD degrades to the pre-VAD behaviour instead of failing the request.
+        When trimming is off the ranges still cover the whole waveform (cut at
+        every speech boundary), which keeps the transcript identical to a
+        VAD-less run while giving the splitter real pauses to cut on.
+        """
+        vad = self._vad_detector()
+        if vad is None:
+            return None
+        try:
+            return vad.regions(wav, keep_silence=not vad.trim_silence)
+        except Exception:
+            logger.warning("voice activity detection failed; decoding all audio", exc_info=True)
+            return None
+
     def transcribe(
         self,
         wav: np.ndarray,
@@ -390,13 +430,15 @@ class TranscriptionEngine:
 
         The waveform is cut at quiet points exactly like the upstream
         ``transcribe()`` does, but we keep the offsets so the response can carry
-        real timestamps.
+        real timestamps. When VAD is on, the cuts land on speech boundaries
+        instead and silence is (optionally) never decoded.
         """
         from .audio import build_segments, split_with_offsets
 
         self.load()
+        regions = self._regions_for(wav)
         pieces_and_offsets = split_with_offsets(
-            wav, chunk_seconds or self.settings.chunk_seconds
+            wav, chunk_seconds or self.settings.chunk_seconds, regions=regions
         )
         if not pieces_and_offsets:
             return []

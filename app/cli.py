@@ -119,11 +119,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="most streaming (interactive) jobs in flight; 0 is unbounded "
         "(default 64)",
     )
-    parser.add_argument(
-        "--cpu-threads",
+    parser.add_argument("--cpu-threads",
         type=int,
         default=None,
         help="torch CPU thread count for the CPU profile (default: auto)",
+    )
+    parser.add_argument(
+        "--vad",
+        action="store_true",
+        default=None,
+        help="trim silence and cut pieces on real pauses with Silero VAD "
+        "(needs the 'vad' extra; big win on mostly-silent call audio)",
+    )
+    parser.add_argument(
+        "--no-vad-trim",
+        action="store_true",
+        help="keep silence in the output and only use VAD for cut points",
+    )
+    parser.add_argument(
+        "--vad-speech-pad-ms",
+        type=int,
+        default=None,
+        help="padding around a speech region in ms (default 250; Silero's 30 "
+        "clips the first syllable)",
     )
     parser.add_argument(
         "--no-tf32",
@@ -169,6 +187,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "max_queue": args.max_queue,
         "max_interactive": args.max_interactive,
         "cpu_threads": args.cpu_threads,
+        "vad_speech_pad_ms": args.vad_speech_pad_ms,
+        "vad_trim_silence": False if args.no_vad_trim else None,
         "tf32": False if args.no_tf32 else None,
         "api_key": args.api_key,
         "log_level": args.log_level,
@@ -176,6 +196,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     if args.lm:
         overrides["use_lm"] = True
+    if args.vad:
+        overrides["use_vad"] = True
 
     os.environ.setdefault("QUAN_ASR_CLI", "1")
     for key, value in overrides.items():
@@ -222,6 +244,8 @@ _ENV_FOR_SETTING = {
     "microbatch_seconds": "MICROBATCH_SECONDS",
     "microbatch_max_wait_ms": "MICROBATCH_MAX_WAIT_MS",
     "cpu_threads": "CPU_THREADS",
+    "vad_speech_pad_ms": "VAD_SPEECH_PAD_MS",
+    "vad_trim_silence": "VAD_TRIM_SILENCE",
     "tf32": "TF32",
     "api_key": "API_KEY",
     "log_level": "LOG_LEVEL",

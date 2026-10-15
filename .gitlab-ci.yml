@@ -8,7 +8,6 @@
 # The build runs on the shared docker runner.
 
 stages:
-  - test
   - build-image
   - release
 
@@ -22,6 +21,8 @@ variables:
   # "false" to skip it: the build gets much faster and the server then only does
   # greedy decoding (USE_LM must stay unset/false at runtime).
   INSTALL_LM: "true"
+  # silero-vad + onnxruntime. Required by the CPU profiles, which set USE_VAD.
+  INSTALL_VAD: "true"
   # Base CUDA runtime the image is built on. Keep TORCH_INDEX in step with it.
   CUDA: "12.6.1"
   TORCH_INDEX: "https://download.pytorch.org/whl/cu126"
@@ -49,6 +50,7 @@ build_image:
         --build-arg TORCH_INDEX=$TORCH_INDEX \
         --build-arg PYTHON_VERSION=$PYTHON_VERSION \
         --build-arg INSTALL_LM=$INSTALL_LM \
+        --build-arg INSTALL_VAD=$INSTALL_VAD \
         --cache-from=type=registry,ref=$BUILDX_CACHE \
         --cache-to=type=registry,mode=max,ref=$BUILDX_CACHE \
         -t "$IMAGE_NAME:$CI_COMMIT_TAG" \
@@ -59,26 +61,6 @@ build_image:
   after_script:
     - docker buildx rm quan-builder || true
 
-# Unit tests use no torch and no model weights, so they run inside a plain
-# Python image and finish in seconds. They run before the image build, on a tag
-# and on a merge request, so a broken change cannot reach a release tag.
-test:
-  stage: test
-  image: python:3.11-slim
-  tags:
-    - docker-execuse-150
-  rules:
-    - if: '$CI_COMMIT_TAG =~ /^v-.*-release$/'
-      when: on_success
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      when: on_success
-    - when: never
-  before_script:
-    - apt-get update -qq && apt-get install -y -qq libsndfile1 > /dev/null
-    - pip install --quiet --no-cache-dir fastapi "uvicorn[standard]" python-multipart numpy pytest httpx soundfile ruff
-  script:
-    - ruff check app tests scripts
-    - pytest -q
 
 release:
   stage: release

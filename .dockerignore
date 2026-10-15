@@ -22,13 +22,15 @@ models
 *.pth
 *.onnx
 
-# Fixtures and scratch audio.
+# Fixtures and scratch audio. The sample clips under samples/ are the one
+# exception: the image ships them so the playground's demo chips work offline.
 tests/audio
 *.wav
 *.mp3
 *.flac
 *.m4a
 *.webm
+!samples/*.mp3
 
 docker
 deploy

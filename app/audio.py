@@ -32,6 +32,7 @@ class Segment:
     text: str
     start: float
     end: float
+    phonemes: str | None = None
 
     @property
     def duration(self) -> float:
@@ -135,32 +136,64 @@ def decode_audio_bytes(data: bytes) -> tuple[np.ndarray, int]:
     return x, int(sr)
 
 
+def _split_range(
+    x: np.ndarray, start: int, end: int, span: int, search: int, win: int
+) -> list[tuple[np.ndarray, int, int]]:
+    """Cut ``x[start:end]`` into pieces of at most ``span`` samples.
+
+    This is the exact ``quan_transcribe.audio.split_quiet`` rule, applied to a
+    sub-range instead of the whole waveform so VAD regions can be split
+    independently.
+    """
+    out: list[tuple[np.ndarray, int, int]] = []
+    pos = start
+    while end - pos > span:
+        lo, hi = pos + span - search, pos + span
+        energy = np.convolve(x[lo:hi] ** 2, np.ones(win), mode="valid")
+        cut = lo + int(np.argmin(energy)) + win // 2
+        out.append((x[pos:cut], pos, cut))
+        pos = cut
+    out.append((x[pos:end], pos, end))
+    return out
+
+
 def split_with_offsets(
-    x: np.ndarray, chunk_s: float, search_s: float = 5.0
+    x: np.ndarray,
+    chunk_s: float,
+    search_s: float = 5.0,
+    regions: list[tuple[int, int]] | None = None,
 ) -> list[tuple[np.ndarray, int, int]]:
     """Cut ``x`` into pieces of at most ``chunk_s`` at the quietest nearby point.
 
-    Returns ``(samples, start_index, end_index)`` triples. The cut points are
-    identical to ``quan_transcribe.audio.split_quiet``; the same short-piece
-    filter is applied, so piece *k* here is exactly what the model decoded.
+    Returns ``(samples, start_index, end_index)`` triples. With no ``regions``
+    the cut points are identical to ``quan_transcribe.audio.split_quiet`` and
+    the pieces tile the whole waveform; the same short-piece filter is applied,
+    so piece *k* here is exactly what the model decoded.
+
+    ``regions`` restricts — and splits — the work to those ``(start, end)``
+    sample ranges. A VAD passes the speech ranges it found so silence between
+    them is never cut up or decoded. Each region is split independently, so the
+    sub-pieces of one region never span into another.
     """
     x = np.asarray(x, dtype=np.float32)
     span = int(chunk_s * SAMPLE_RATE)
     if span <= 0:
         raise ValueError("chunk_s must be positive")
 
-    pieces: list[tuple[np.ndarray, int, int]] = []
-    start = 0
+    if regions is None:
+        regions = [(0, len(x))]
     win = int(0.05 * SAMPLE_RATE)
+    # Never search back further than the span itself: for a very small span a
+    # 5 s search would reach before the range start.
     search = min(int(search_s * SAMPLE_RATE), span - win)
 
-    while len(x) - start > span:
-        lo, hi = start + span - search, start + span
-        energy = np.convolve(x[lo:hi] ** 2, np.ones(win), mode="valid")
-        cut = lo + int(np.argmin(energy)) + win // 2
-        pieces.append((x[start:cut], start, cut))
-        start = cut
-    pieces.append((x[start:], start, len(x)))
+    pieces: list[tuple[np.ndarray, int, int]] = []
+    for start, end in regions:
+        start = max(0, int(start))
+        end = min(len(x), int(end))
+        if end - start <= 0:
+            continue
+        pieces.extend(_split_range(x, start, end, span, search, win))
 
     minimum = int(MIN_PIECE_SECONDS * SAMPLE_RATE)
     return [p for p in pieces if len(p[0]) > minimum]

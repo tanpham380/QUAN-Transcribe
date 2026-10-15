@@ -42,6 +42,12 @@ _KNOWN_FIELDS = frozenset(
         "use_lm",
         "beam_width",
         "chunk_seconds",
+        "punctuate",
+        "enable_punctuation",
+        "phonemes",
+        "include_phonemes",
+        "g2p",
+        "norm_mode",
     }
 )
 
@@ -92,6 +98,9 @@ class TranscriptionParams:
     use_lm: bool | None = None
     beam_width: int | None = None
     chunk_seconds: float | None = None
+    punctuate: bool = False
+    phonemes: bool = False
+    norm_mode: str = "itn"
 
     @property
     def wants_timestamps(self) -> bool:
@@ -235,6 +244,32 @@ def parse_transcription_form(form: Any) -> TranscriptionParams:
                 "chunk_seconds",
             )
 
+    punctuate = False
+    raw_punc = (
+        form.get("punctuate")
+        if form.get("punctuate") is not None
+        else form.get("enable_punctuation")
+    )
+    if raw_punc not in (None, ""):
+        punctuate = _parse_bool(raw_punc, "punctuate")
+
+    phonemes = False
+    raw_phonemes = (
+        form.get("phonemes")
+        if form.get("phonemes") is not None
+        else (form.get("include_phonemes") if form.get("include_phonemes") is not None else form.get("g2p"))
+    )
+    if raw_phonemes not in (None, ""):
+        phonemes = _parse_bool(raw_phonemes, "phonemes")
+
+    norm_mode = "itn"
+    raw_norm = form.get("norm_mode")
+    if raw_norm not in (None, ""):
+        norm_val = str(raw_norm).strip().lower()
+        if norm_val not in ("itn", "tn", "none", "raw"):
+            raise _bad("norm_mode must be 'itn', 'tn', or 'none'", "norm_mode")
+        norm_mode = "none" if norm_val == "raw" else norm_val
+
     prompt = form.get("prompt")
     return TranscriptionParams(
         filename=filename,
@@ -249,4 +284,7 @@ def parse_transcription_form(form: Any) -> TranscriptionParams:
         use_lm=use_lm,
         beam_width=beam_width,
         chunk_seconds=chunk_seconds,
+        punctuate=punctuate,
+        phonemes=phonemes,
+        norm_mode=norm_mode,
     )

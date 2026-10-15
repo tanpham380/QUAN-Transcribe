@@ -5,27 +5,90 @@ An OpenAI-compatible speech-to-text server for
 packaged as a container that runs on [GPUStack](https://gpustack.ai) as a custom
 backend.
 
-Drop-in replacement for the OpenAI transcription endpoint: point any existing
-client at this server and it keeps working. On top of that it adds real
-timestamps, Server-Sent Events streaming, a WebSocket for live microphone audio,
-optional KenLM beam-search decoding, and a small browser playground.
+Point any existing OpenAI client at this server and it keeps working. On top of
+the compatible endpoint it adds real timestamps, Server-Sent Events streaming, a
+WebSocket for live microphone audio, optional KenLM beam-search decoding, a
+scheduler that keeps live audio responsive under load, and a small browser
+playground.
 
-The model is Vietnamese-only and single-pass CTC, so it is fast — roughly
-3,700× realtime on an H100 — and its output is lowercase Vietnamese without
-punctuation, with numbers written as words.
+The model behind it is a **356M-parameter, Vietnamese-only, single-pass CTC
+network** built on Google's EmbeddingGemma 2 audio encoder. There is no
+autoregressive decoder and no KV cache: one forward pass per piece of audio. That
+makes it roughly **3,700× faster than realtime on a single H100** (upstream
+benchmark) and makes its output lowercase Vietnamese without punctuation, with
+numbers written as words.
+
+### What this repository is
+
+- A **serving layer**, not a training repo. It wraps the upstream
+  [`quan_transcribe`](https://github.com/qnguyen3/QUAN-Transcribe) inference
+  library and adds the HTTP/streaming/scheduling surface around it.
+- **Production-shaped**: one model-owning scheduler thread, real backpressure
+  (`503` instead of unbounded latency), lazy imports so the process starts
+  without a GPU, `/health` and `/metrics`, structured OpenAI-style errors, and a
+  container that is ready for GPUStack.
+- **Single-model and Vietnamese-only.** It is not a multi-tenant, multi-model
+  router, and it will not transcribe other languages correctly.
 
 ## Contents
 
+- [Architecture](#architecture)
 - [Quick start](#quick-start)
 - [API](#api)
+- [Errors and limits](#errors-and-limits)
+- [Observability](#observability)
 - [Streaming](#streaming)
 - [Optional n-gram language model](#optional-n-gram-language-model)
+- [Voice activity detection](#voice-activity-detection)
 - [Configuration](#configuration)
 - [Performance](#performance)
 - [Docker](#docker)
 - [Deploying on GPUStack](#deploying-on-gpustack)
 - [GitLab CI](#gitlab-ci)
 - [Development](#development)
+- [Licence](#licence)
+
+## Architecture
+
+```
+                     ┌──────────────── app/server.py (FastAPI) ───────────────┐
+  HTTP  ────────────►│ POST /v1/audio/transcriptions   ── buffered or SSE    │
+  (multipart)        │ GET  /health  /metrics  /v1/models  /  /docs          │
+                     └───────────────┬───────────────────────┬───────────────┘
+  WS ───────────────► /v1/audio/transcriptions/stream         │
+  (16 kHz PCM)                  │                             │
+                                ▼                             ▼
+                     ┌── app/engine.py ─────────┐   ┌── app/audio.py ────────┐
+                     │ TranscriptionEngine      │   │ decode → 16 kHz mono   │
+                     │  · lazy torch / model    │   │ quiet-point splitting  │
+                     │  · LiveStream sessions   │   └────────────────────────┘
+                     └───────────┬──────────────┘
+                                 │  submit() / submit_bulk()
+                                 ▼
+                     ┌── app/core.py ───────────────────────────────────────┐
+                     │ EngineCore — ONE thread that owns the model          │
+                     │  · interactive (live/SSE) preempts bulk (files)      │
+                     │  · coalesces pieces into one padded forward pass     │
+                     │  · bounded queues → EngineBusy → HTTP 503            │
+                     └──────────────────┬───────────────────────────────────┘
+                                        ▼
+                          quan_transcribe (upstream library + torch)
+```
+
+Three invariants make the rest of the document make sense:
+
+1. **The model is not re-entrant**, so exactly one thread may touch it. That
+   thread is `EngineCore`; every model call goes through it, from any request
+   thread. There is no global lock held across a request, which is why a live
+   step does not queue behind a ten-minute file. See [Performance](#performance).
+2. **Importing `app` never imports torch.** `torch` and `quan_transcribe` are
+   imported lazily inside `TranscriptionEngine._load()`, so the process starts
+   instantly, `/health` can report `loading`, and the test suite runs with no
+   GPU and no model download.
+3. **Streaming is honest by construction.** The encoder attention is chunked
+   with left context only and the reader's convolution is causal, so nothing
+   ever looks more than one chunk ahead — the partial text is what the model
+   would have produced if the audio stopped there.
 
 ## Quick start
 
@@ -43,14 +106,24 @@ curl -s -F "file=@sample.wav" http://127.0.0.1:8000/v1/audio/transcriptions
 # {"text": "xin chào tôi tên là nam"}
 ```
 
+The `samples/` directory holds two real recordings to try it on, with a short
+note on what each one contains and what VAD does to it:
+
+```bash
+curl -s -F "file=@samples/voicemail-90s.mp3" http://127.0.0.1:8000/v1/audio/transcriptions
+```
+
 Open <http://127.0.0.1:8000/> for the playground: upload a file to watch the
 streamed transcript, or hold the record button to transcribe from the mic.
 
 ### Requirements
 
+- **Python 3.10+.** The container ships 3.11; this repository is developed and
+  tested on 3.11 and 3.14.
 - **PyTorch matching your CUDA driver.** The Dockerfile installs the cu126
   build; for a manual install pick the right index, e.g.
   `pip install torch --index-url https://download.pytorch.org/whl/cu124`.
+  Apple Silicon (`mps`) and CPU work too — no CUDA required.
 - **An `HF_TOKEN` with access to [`google/embeddinggemma-2`].** The audio
   encoder is a gated Gemma model, so you must accept its terms on Hugging Face
   and then `hf auth login` (or export `HF_TOKEN`) before the first run.
@@ -61,92 +134,319 @@ streamed transcript, or hold the record button to transcribe from the mic.
 
 ## API
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `POST` | `/v1/audio/transcriptions` | Transcribe an uploaded file (OpenAI-compatible) |
-| `WS` | `/v1/audio/transcriptions/stream` | Live transcription of raw PCM |
-| `GET` | `/v1/models` | List the served model |
-| `GET` | `/v1/models/{id}` | Fetch one model |
-| `GET` | `/health` | Liveness plus real model state |
-| `GET` | `/metrics` | Request counters and engine info |
-| `GET` | `/` | Browser playground |
-| `GET` | `/docs` | Interactive OpenAPI documentation |
+| Method | Path | Auth | Purpose |
+| --- | --- | --- | --- |
+| `POST` | `/v1/audio/transcriptions` | key | Transcribe an uploaded file (OpenAI-compatible); buffered or SSE |
+| `WS` | `/v1/audio/transcriptions/stream` | key | Live transcription of 16 kHz PCM |
+| `GET` | `/v1/models` | – | List the served model |
+| `GET` | `/v1/models/{id}` | – | Fetch one model |
+| `GET` | `/health` | – | Liveness plus real model state |
+| `GET` | `/metrics` | – | Request counters and engine info |
+| `GET` | `/` | – | Browser playground |
+| `GET` | `/docs` | – | Swagger UI (FastAPI default) |
+| `GET` | `/openapi.json` | – | OpenAPI schema (FastAPI default) |
+
+"key" means the route requires `Authorization: Bearer <API_KEY>` **only when
+`API_KEY` is set**; with no `API_KEY` every route is open. The read-only routes
+above are always open, which is deliberate: an orchestrator must be able to probe
+`/health` without credentials.
 
 ### `POST /v1/audio/transcriptions`
 
-`multipart/form-data`. All documented OpenAI parameters are accepted:
+`multipart/form-data`. The endpoint accepts the documented OpenAI parameters:
 
 | Parameter | Default | Notes |
 | --- | --- | --- |
-| `file` | *required* | Audio to transcribe |
-| `model` | served name | Validated against `/v1/models` |
-| `language` | `vi` | `vi`/`vietnamese` only; anything else is `unsupported_language` |
-| `response_format` | `json` | `json`, `text`, `srt`, `verbose_json`, `vtt` |
+| `file` | *required* | Audio to transcribe. Empty file → `invalid_audio_file`; undecodable → same |
+| `model` | served name | Validated; see [model aliases](#model-aliases) |
+| `language` | `vi` | `vi`, `vietnamese`, `vi-VN`, `VI`… all normalise to `vi`. `auto`/`none` are accepted and mean "no language" |
+| `response_format` | `json` | One of `json`, `text`, `srt`, `verbose_json`, `vtt` |
 | `prompt` | – | Accepted for compatibility; a CTC model has no prompt channel |
-| `temperature` | `0.0` | Accepted for compatibility; decoding is deterministic |
+| `temperature` | `0.0` | Accepted and validated (`0.0`–`1.0`); decoding is deterministic, so it has no effect |
 
 Extensions this server adds:
 
-| Parameter | Default | Notes |
-| --- | --- | --- |
-| `stream` | `false` | Return Server-Sent Events instead of a buffered body |
-| `stream_partials` | `true` | Emit in-progress text while streaming |
-| `use_lm` | server setting | Force beam search on/off for this request |
-| `beam_width` | `32` | Beams kept by the beam search |
-| `left_chunks` | server setting | Past chunks the reader may attend to |
-| `chunk_seconds` | `30` | Cut long audio into pieces of at most this many seconds |
+| Parameter | Default | Bounds | Notes |
+| --- | --- | --- | --- |
+| `stream` | `false` | bool | Return Server-Sent Events instead of a buffered body |
+| `stream_partials` | `true` | bool | Emit in-progress `transcript.text.delta` events while streaming |
+| `punctuate` | `false` | bool | Intelligent punctuation, capitalization & Inverse Text Normalization (ITN) |
+| `phonemes` | `false` | bool | Grapheme-to-Phoneme IPA output powered by [`sea-g2p`](https://github.com/pnnbao97/sea-g2p) |
+| `norm_mode` | `itn` | `itn`/`tn`/`none` | Text norm mode: `itn` (spoken to digits/symbols), `tn` (`sea-g2p` spoken words), or `none` |
+| `use_lm` | server setting | bool | Force beam search on/off for this request |
+| `beam_width` | `32` | `1`–`256` | Beams kept by the beam search |
+| `left_chunks` | server setting | `>= 0` | Past chunks the reader may attend to; `0` = lowest latency |
+| `chunk_seconds` | `30` | `1`–`300` | Cut long audio into pieces of at most this many seconds |
+| `timestamp_granularities[]` | – | `word`/`segment` | Only valid with `verbose_json`, `srt` or `vtt` |
+
+Out-of-range values and unknown `response_format`/`language` values are rejected
+with `400` — see [Errors and limits](#errors-and-limits). **Unknown form fields
+are ignored**, matching OpenAI's forward-compatible behaviour, so a client that
+sends a parameter this server does not know about still works.
+
+Every response format maps to a media type:
+
+| `response_format` | `Content-Type` |
+| --- | --- |
+| `json`, `verbose_json` | `application/json` |
+| `text` | `text/plain; charset=utf-8` |
+| `srt` | `application/x-subrip; charset=utf-8` |
+| `vtt` | `text/vtt; charset=utf-8` |
 
 ```bash
 # Plain text
 curl -s -F "file=@sample.wav" -F "response_format=text" \
   http://127.0.0.1:8000/v1/audio/transcriptions
+# xin chào tôi tên là nam
 
 # Subtitles
 curl -s -F "file=@sample.wav" -F "response_format=srt" \
   http://127.0.0.1:8000/v1/audio/transcriptions
+# 1
+# 00:00:00,000 --> 00:00:02,480
+# xin chào tôi tên là nam
+
+# Verbose JSON (segments + metadata)
+curl -s -F "file=@sample.wav" -F "response_format=verbose_json" \
+  http://127.0.0.1:8000/v1/audio/transcriptions
+# {"task":"transcribe","language":"vi","duration":2.48,
+#  "text":"xin chào tôi tên là nam",
+#  "segments":[{"id":0,"seek":0,"start":0.0,"end":2.48,"text":" xin chào tôi tên là nam", ...}],
+#  "words":[],"model":"QUAN-Transcribe-1.0"}
+
+# Optional accuracy boost for this one request
+curl -s -F "file=@sample.wav" -F "use_lm=true" -F "beam_width=32" \
+  http://127.0.0.1:8000/v1/audio/transcriptions
 ```
 
-`verbose_json` returns OpenAI-shaped segments with `start`/`end` in seconds,
-derived from the quiet points where the audio was actually cut, so the
-timestamps line up with what the model decoded. Segments that were split
-mid-sentence are merged back together when there is no terminal punctuation and
-the gap is under 0.5 s.
+`verbose_json` returns OpenAI-shaped segments whose `start`/`end` come from the
+quiet points where the audio was actually cut, so the timestamps line up with
+what the model decoded. Segments split mid-sentence are merged back together when
+there is no terminal punctuation and the gap is under 0.5 s. Per-sentence
+timestamps are the finest granularity available: `words` is always `[]` and the
+`tokens` arrays are placeholders, because a single CTC pass does not produce
+per-token alignment. `timestamp_granularities[]` is accepted for compatibility
+and only affects whether that merge is suppressed.
+
+#### Model aliases
+
+`_check_model` accepts anything that identifies the served model, so clients do
+not need to know the deployment's exact name:
+
+- the configured `SERVED_MODEL_NAME` (default `QUAN-Transcribe-1.0`),
+- the `MODEL_PATH` value or the basename of the model directory,
+- and the aliases `whisper-1`, `quan-transcribe`, `quan-transcribe-1.0`,
+  `quan-asr`.
+
+Anything else is `404 model_not_found`. The alias list is what makes this a
+drop-in replacement for code that hard-codes `model="whisper-1"`.
+
+## Errors and limits
+
+Every error from the HTTP endpoints uses OpenAI's envelope:
+
+```json
+{"error": {"message": "the uploaded file is empty",
+           "type": "invalid_request_error",
+           "param": null, "code": "invalid_audio_file"}}
+```
+
+The full set of `code` values, with the HTTP status and when they fire:
+
+| Status | `code` | `type` | When |
+| --- | --- | --- | --- |
+| `400` | `invalid_value` | `invalid_request_error` | A numeric form field is out of range (`chunk_seconds`, `beam_width`, `temperature`, `left_chunks`) |
+| `400` | `unsupported_language` | `invalid_request_error` | `language` is neither Vietnamese nor `auto`/`none` |
+| `400` | `invalid_audio_file` | `invalid_request_error` | Empty upload, or bytes that libsndfile and ffmpeg both refuse |
+| `400` | `invalid_request_body` | `invalid_request_error` | Malformed multipart body / missing `file` field |
+| `401` | `invalid_api_key` | `authentication_error` | `API_KEY` set and the token is missing or wrong |
+| `404` | `model_not_found` | `invalid_request_error` | `model` is not the served model or one of its aliases |
+| `404` | `not_found` | `invalid_request_error` | Unknown route |
+| `413` | `payload_too_large` | `invalid_request_error` | Upload larger than `MAX_UPLOAD_MB` (default `200`) |
+| `503` | `server_busy` | `server_error` | The decode queue is full — retry after the backlog clears |
+| `503` | – | `server_error` | The model is still loading, or a requested LM is not loaded |
+
+Two caveats worth knowing:
+
+- **`server_busy` is retryable and intentional.** It is the scheduler refusing
+  work rather than parking another thread and letting latency grow without
+  bound — see [Performance](#performance). Back off and retry.
+- **A mid-stream failure is not an HTTP error.** Once an SSE response has
+  started, the status is already `200`; a decode failure arrives as an `error`
+  event in the body (see below). If you need a trustworthy status code, use the
+  buffered (non-`stream`) mode.
+
+Limits that are enforced, in one place: `MAX_UPLOAD_MB` (413), `MAX_STREAM_SECONDS`
+for WebSocket sessions, `chunk_seconds` ∈ [1, 300], `beam_width` ∈ [1, 256],
+`temperature` ∈ [0, 1], `left_chunks` ≥ 0, and the two queue caps `MAX_QUEUE` /
+`MAX_INTERACTIVE` (503).
+
+## Observability
+
+### `GET /health`
+
+Always `200` while the model is loading, and only `503` after a **hard** load
+failure. That is deliberate: an orchestrator probe must not restart a container
+that is merely downloading 356M parameters for the first time.
+
+```json
+{"status": "ok", "model": "QUAN-Transcribe-1.0", "device": "cuda:0",
+ "language": "vi", "loaded": true, "error": null}
+```
+
+`status` is `loading` before the model is up, `ok` once it is, and `error` if it
+failed — with the exception text in `error`. `device` reports the resolved device
+(`cuda:0`, `mps`, `cpu`) once loaded, and the configured value or `unknown`
+before that.
+
+### `GET /metrics`
+
+`{**engine.metrics(), **engine.info()}` — request counters, resolved
+configuration, and the scheduler's own view:
+
+| Group | Keys |
+| --- | --- |
+| Counters | `requests_total`, `audio_seconds_total`, `decode_seconds_total`, `realtime_factor` |
+| Model | `model`, `model_path`, `loaded`, `device`, `profile`, `language`, `lm`, `lm_path`, `lm_alpha`, `lm_beta`, `beam_width`, `load_error`, `load_seconds`, `loaded_at` |
+| Live streaming | `chunk_seconds`, `stream_step_seconds`, `left_chunks` |
+| Scheduler config | `microbatch_seconds`, `microbatch_max_requests`, `microbatch_max_wait_ms`, `max_queue`, `max_interactive`, `subbatch_seconds`, `tf32` |
+| `core` | `batches_run`, `pieces_run`, `jobs_run`, `queued_pieces`, `queued_interactive`, `shed`, `avg_batch_size`, `p50_latency_ms`, `p95_latency_ms`, `model_seconds` |
+
+`realtime_factor` is `decode_seconds_total / audio_seconds_total` (lower is
+better; `0.10` means ten times faster than realtime). The `core` block is the
+direct answer to "is coalescing working and am I shedding load?":
+
+- `batches_run` well below `jobs_run` means concurrent requests are sharing
+  forward passes.
+- `shed > 0` means clients are being refused with `503` — raise `MAX_QUEUE` or
+  add capacity.
+- `queued_pieces` / `queued_interactive` are the current backlogs.
+- `p50_latency_ms` / `p95_latency_ms` are over a rolling window of the last 4096
+  jobs (null until there is a sample).
 
 ## Streaming
 
 ### Server-Sent Events
 
-Set `stream=true` and the response becomes a stream of events:
+Set `stream=true` and the response is `text/event-stream` with
+`Cache-Control: no-cache, no-transform` and `X-Accel-Buffering: no` (so nginx
+does not buffer it). Each frame is a single `data:` line of JSON followed by a
+blank line:
 
 ```
 data: {"type": "transcript.text.delta", "text": "xin", "start": 0.0, "end": 0.48}
 data: {"type": "transcript.text.segment", "text": "xin chào", "start": 0.0, "end": 1.0}
 data: {"type": "transcript.text.completed", "text": "", "start": 0.0, "end": 2.0}
-data: {"type": "transcript.text.done", "text": "xin chào tôi tên là nam", "duration": 2.0}
+data: {"type": "transcript.text.done", "text": "xin chào tôi tên là nam", "duration": 2.0, "model": "QUAN-Transcribe-1.0", "language": "vi", "elapsed": 2.31}
 ```
 
-- `transcript.text.delta` — unstable text, expected to change (`stream_partials=false` removes these)
-- `transcript.text.segment` — a finalized segment with its timestamps
-- `transcript.text.completed` — end-of-audio marker
-- `transcript.text.done` — the final transcript plus `duration`, `model`, `language`, `elapsed`
+| Event `type` | Keys | Meaning |
+| --- | --- | --- |
+| `transcript.text.delta` | `type, text, start, end` | Unstable text, expected to change (`stream_partials=false` removes these) |
+| `transcript.text.segment` | `type, text, start, end` | A finalized segment with its timestamps |
+| `transcript.text.completed` | `type, text, start, end` | End-of-audio marker (`text` is always `""`) |
+| `transcript.text.done` | `type, text, duration, model, language, elapsed` | Always last. `duration` is the file length, `elapsed` the wall time of the whole stream |
+| `error` | `type, error.message` | Decode failed mid-stream |
 
-Disconnecting the client stops the decode thread at the next chunk boundary.
+If the client disconnects, the server sets a stop flag and stops decoding at the
+next event boundary instead of finishing a file nobody is reading. `stop` is
+checked *between* steps, so an in-flight forward pass still completes.
 
 ### WebSocket
 
-`/v1/audio/transcriptions/stream` accepts raw audio and pushes JSON events back.
-Send a JSON handshake first, then binary frames:
+`/v1/audio/transcriptions/stream` is for live microphone audio. All parameters
+are **query-string** parameters — there is no handshake frame:
+
+| Query param | Values | Default |
+| --- | --- | --- |
+| `format` | `f32`, `pcm16` | `f32` |
+| `left_chunks` | integer ≥ 0 | server default |
+| `use_lm` | truthy string | server default |
+| `beam_width` | integer ≥ 1 | server `BEAM_WIDTH` |
+| `api_key` | the API key | – (alternative to the `Authorization: Bearer` header) |
+
+On connect the server immediately sends one frame describing the session, then
+you send **binary** frames of raw mono audio:
 
 ```json
-{"type": "config", "sample_rate": 16000, "encoding": "pcm16", "left_chunks": null}
+{"type": "session.created", "model": "QUAN-Transcribe-1.0", "language": "vi",
+ "format": "f32", "sample_rate": 16000, "step_seconds": 0.48,
+ "left_chunks": null, "use_lm": false, "beam_width": 32}
 ```
 
-`encoding` is `pcm16` or `f32`, `sample_rate` is the rate you are sending (the
-server resamples to 16 kHz), and `left_chunks` overrides the server default for
-this session. Send `{"type": "flush"}` to force the current utterance out, and
-`{"type": "stop"}` to finish. Audio is segmented on ~0.8 s of silence
-(`ENDPOINT_SECONDS`), and an utterance is force-cut at a quiet point after
-`MAX_UTTERANCE_SECONDS`.
+- **`sample_rate` is 16000 and the server does not resample this path.** You
+  must send 16 kHz mono audio. This is the one thing to get right: 8 kHz or
+  44.1 kHz input is decoded as if it were 16 kHz and produces garbage. (The
+  browser playground resamples client-side with linear interpolation before it
+  sends, for exactly this reason.)
+- `format=f32` means **little-endian float32** in `[-1, 1]`. `format=pcm16`
+  means **little-endian signed int16**, scaled by `/32768`. A trailing partial
+  sample on the `f32` path is tolerated and dropped; keep `pcm16` frames an even
+  number of bytes.
+- Audio is buffered until at least one step (`0.48 s`) has arrived, then events
+  start. Send `step_seconds` worth of audio per frame to keep latency low.
+
+Text frames on the socket are **control messages** and must be the bare
+lowercase strings, not JSON:
+
+| You send | Server replies |
+| --- | --- |
+| `stop`, `flush`, `eof` | `{"type": "transcript.text.done", "text": "…", "final": true, "end": 2.4}` (omitted if nothing was decoded), then `session.closed` |
+| `ping` | `{"type": "pong"}` |
+| anything else | `error` with `unknown control message: '…'`; the session stays open |
+
+`stop`, `flush` and `eof` are equivalent: all three flush the current utterance
+and end the session. The server always finishes with
+`{"type": "session.closed"}`.
+
+Failure modes are signalled by a close code, after an `error` frame:
+
+| Code | Reason |
+| --- | --- |
+| `4401` | `API_KEY` set and the token (header or `?api_key=`) is wrong |
+| `4400` | Bad `format`, or `left_chunks`/`beam_width` is not an integer |
+| `1011` | `use_lm` was requested but no KenLM model is loaded |
+| `1000` | Normal close |
+
+When the scheduler is saturated, a binary frame can come back as an `error` with
+`code: "server_busy"`. The audio is **not lost** — the server re-buffers it — so
+slow down and the next frame retries it. A session longer than
+`MAX_STREAM_SECONDS` (default one hour) gets an `error` frame and closes
+gracefully.
+
+```python
+# Minimal client: 16 kHz mono float32, 0.48 s per frame.
+import asyncio
+import websockets
+import soundfile as sf
+
+URL = "ws://127.0.0.1:8000/v1/audio/transcriptions/stream?format=f32"
+STEP = int(0.48 * 16000)
+
+async def main(path="mic16k.wav"):
+    audio, sr = sf.read(path, dtype="float32", always_2d=True)
+    assert sr == 16000, f"resample first: got {sr} Hz"
+    samples = audio.mean(1)  # mono
+
+    async with websockets.connect(URL) as ws:
+        print(await ws.recv())  # session.created
+        for i in range(0, len(samples), STEP):
+            block = samples[i : i + STEP].astype("<f4")
+            await ws.send(block.tobytes())
+        await ws.send("stop")  # flush + end the session
+
+        while True:
+            message = await ws.recv()
+            print(message)
+            if '"session.closed"' in message:
+                break
+
+asyncio.run(main())
+```
+
+`scripts/ws_probe.py` is a fuller version of this that prints every event and
+can point at any running server. It needs the `websockets` package, which
+`uvicorn[standard]` already pulls in.
 
 ### How streaming stays honest
 
@@ -156,6 +456,10 @@ earlier ones. Nothing ever looks more than one chunk ahead, so the partial
 output is the same text the model would produce if the audio simply stopped
 there. `left_chunks` caps how far back the reader looks: `None` (the default)
 uses all history for best accuracy, `0` gives the lowest latency.
+
+Live utterances are also segmented: `ENDPOINT_SECONDS` of silence (`0.8`)
+finalises a sentence, and one is force-cut at a quiet point after
+`MAX_UTTERANCE_SECONDS` (`30`).
 
 ## Optional n-gram language model
 
@@ -199,8 +503,9 @@ Or with flags: `--lm`, `--lm-path`, `--beam-width`, `--lm-alpha`, `--lm-beta`.
 - The bundled LM was trained on about **29M words** of Vietnamese news
   (Leipzig corpora) and Wikipedia.
 - A request can override the server default with `use_lm=false` (force greedy)
-  or `use_lm=true`. Asking for an LM that is not loaded is a `503`, not a silent
-  downgrade.
+  or `use_lm=true`. Asking for an LM that is not loaded is refused, not silently
+  downgraded: a buffered request gets `503`, and a streaming one gets an `error`
+  event (the SSE status is already `200` by then).
 
 Installing it needs a C++ compiler because `kenlm` has no prebuilt wheel:
 
@@ -211,18 +516,62 @@ pip install ".[lm]"
 In Docker this is gated by `--build-arg INSTALL_LM=false` if you would rather
 skip the compile entirely and ship a greedy-only image.
 
+## Voice activity detection
+
+Call and voicemail audio is mostly *not* speech. A measured 90 s voicemail
+greeting in `samples/` is 78 s of digital silence and ringback tone and 7 s of
+speech; a 72 s sales call is 59% speech. The model already returns nothing for
+the silent parts, but it still pays for them — a forward pass over 83 s of
+silence costs the same as 83 s of speech.
+
+`USE_VAD=true` runs [Silero VAD](https://github.com/snakers4/silero-vad) over
+the waveform first, then decodes only what it found:
+
+- **Silence is never decoded.** Only the speech regions are cut into pieces.
+  On the 90 s voicemail that means decoding ~7 s instead of 90 s.
+- **Pieces are cut on real pauses,** not on the quietest 50 ms window, so a cut
+  no longer lands in the middle of a word.
+- **`VAD_TRIM_SILENCE=false` keeps the silence** and uses VAD only for cut
+  points. The transcript is then byte-for-byte what a VAD-less run produces,
+  while the decoder still gets clean boundaries.
+
+What it costs is small: Silero ONNX runs at about **0.008 RTF** on one CPU core
+(~0.7 s for the 90 s file), and it runs on the request thread, never the model
+thread, so it cannot stall a decode. The ONNX session is ~2.5× faster than the
+TorchScript one and is preferred automatically; the package also calls
+`torch.set_num_threads(1)` at import, which this server captures and restores so
+it cannot silently cap CPU decoding for the whole process.
+
+**Tuning.** `VAD_SPEECH_PAD_MS` defaults to `250`, deliberately higher than
+Silero's own `30`: this encoder needs the lead-in, and 30 ms clips the first
+syllable of a region (`quý khách` degrades to `cách`). The other knobs are
+`VAD_THRESHOLD` (0.5) and `VAD_MIN_SILENCE_MS` (300).
+
+It is off by default. Turn it on for call-centre or voicemail workloads; leave
+it off if your audio is already clean, clipped speech, where the extra pass buys
+nothing. The CPU profiles in `deploy/` and `docker/docker-compose.yaml` enable
+it, because CPU time is the scarce resource there.
+
+```bash
+pip install ".[vad]"     # silero-vad + onnxruntime; the image already ships it
+```
+
+If the package is missing while `USE_VAD=true`, the server logs a warning and
+falls back to energy-based splitting for that request rather than failing it.
+
 ## Configuration
 
 Every setting is an environment variable, so the same image works for
-GPUStack, `docker run`, and the CLI. Command-line flags win over the
-environment.
+GPUStack, `docker run`, and the CLI. A CLI flag beats the environment, because
+the CLI writes each non-default flag into the environment before the settings
+are read.
 
 ### Model
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `MODEL_PATH` | `qnguyen3/QUAN-Transcribe-1.0` | HF repo id or local directory |
-| `SERVED_MODEL_NAME` | `QUAN-Transcribe-1.0` | Name clients pass as `model` |
+| `MODEL_PATH` | `qnguyen3/QUAN-Transcribe-1.0` | HF repo id or local directory. Legacy alias `QUAN_MODEL` |
+| `SERVED_MODEL_NAME` | `QUAN-Transcribe-1.0` | Name clients pass as `model`. Legacy alias `MODEL_NAME` |
 | `DEVICE` | auto | `cuda`, `cuda:1`, `mps`, `cpu` |
 | `HF_TOKEN` | – | For the gated audio encoder |
 | `PRELOAD` | `true` | Load at startup rather than on the first request |
@@ -240,6 +589,19 @@ environment.
 | `CHUNK_SECONDS` | `30.0` | Max seconds per decoded piece |
 | `BATCH_SECONDS` | `600.0` | Padding budget per forward pass; lower it if VRAM is tight |
 | `SUBBATCH_SECONDS` | `0` (off) | Hard cap on one forward pass, in audio seconds. Bounds how long a live step can wait behind a file; see [Performance](#performance). CPU profiles ship `30` |
+
+### Voice activity detection
+
+Requires the `vad` extra. See [Voice activity detection](#voice-activity-detection).
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `USE_VAD` | `false` | Silero VAD: skip silence, cut pieces on real pauses |
+| `VAD_TRIM_SILENCE` | `true` | `false` keeps the silence and uses VAD only for cut points |
+| `VAD_SPEECH_PAD_MS` | `250` | Padding around a speech region; Silero's `30` clips the first syllable |
+| `VAD_THRESHOLD` | `0.5` | Speech probability that marks a 32 ms window as speech |
+| `VAD_MIN_SPEECH_MS` | `250` | Shortest run of speech worth keeping |
+| `VAD_MIN_SILENCE_MS` | `300` | Silence that ends a speech region |
 
 ### Throughput
 
@@ -270,14 +632,14 @@ more than one client at a time. See [Performance](#performance).
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | |
-| `API_KEY` | – | When set, every request needs `Authorization: Bearer <key>` |
+| `API_KEY` | – | When set, `POST /v1/audio/transcriptions` and the WebSocket need `Authorization: Bearer <key>` (REST also accepts `x-api-key`; the socket also accepts `?api_key=`) |
 | `CORS_ORIGINS` | `*` | Comma-separated |
-| `MAX_UPLOAD_MB` | `200` | Rejects larger uploads |
+| `MAX_UPLOAD_MB` | `200` | Rejects larger uploads with `413` |
 | `LOG_LEVEL` | `info` | |
 
-`/health` returns `200` with `"status": "loading"` while the weights download,
-and only `503` after a hard failure. That keeps the GPUStack probe from
-flapping during a multi-minute first start.
+`/health` reports `loading` while the weights download and only fails after a
+hard error, so the GPUStack probe does not flap during a multi-minute first
+start. See [Observability](#observability) for the full response.
 
 ## Performance
 
@@ -316,7 +678,8 @@ goes through it. One owner is what makes the rest possible:
   decode. When it is full, new uploads get a `503` (`"code": "server_busy"`)
   instead of parking another thread, so saturation shows up as a fast, retryable
   refusal rather than latency that grows without bound. Set `MAX_QUEUE=0` to
-  disable the cap.
+  disable the cap. `MAX_INTERACTIVE` does the same for streaming jobs, with the
+  same retryable refusal.
 
 The cost of coalescing is up to `MICROBATCH_MAX_WAIT_MS` of added latency, and
 only on the first piece of a request. Set `MICROBATCH_SECONDS=0` to batch only
@@ -336,7 +699,8 @@ different model behaviour.
 `GET /metrics` reports the scheduler under `core`: `batches_run`, `pieces_run`,
 `jobs_run`, `queued_pieces`, `queued_interactive`, `shed`, `avg_batch_size` and
 `p50_latency_ms` / `p95_latency_ms` — the direct way to see whether coalescing
-is working and whether you are shedding load.
+is working and whether you are shedding load. See
+[Observability](#observability) for the full key list.
 
 Try `MICROBATCH_SECONDS=0` first if you serve one client at a time.
 
@@ -412,9 +776,24 @@ docker run --gpus all -p 8000:8000 \
 `docker/docker-compose.yaml` ships two profiles built from the same image:
 
 ```bash
-docker compose --profile gpu up    # GPU: port 8000, no device pin, TF32 on
-docker compose --profile cpu up    # CPU: port 8001, DEVICE=cpu, wider batching
+docker compose --profile gpu up    # port 8000, DEVICE=cuda, TF32 on, reserves an nvidia device
+docker compose --profile cpu up    # port 8001, DEVICE=cpu, TF32 off, a longer coalescing window
 ```
+
+Both mount a named `hf-cache` volume at `/cache/huggingface`, so the weights
+survive a restart, and both read `HF_TOKEN` from your shell or a `.env` file.
+The CPU profile trades latency for throughput — a wider coalescing window
+(`MICROBATCH_SECONDS=0.25`) with a shorter hard cap (`MICROBATCH_MAX_WAIT_MS=10`)
+and a `SUBBATCH_SECONDS=30` cap so a live step can still preempt a file.
+
+Two things the image deliberately does **not** do:
+
+- **It has no `USER`**, so the process runs as root. That is what lets an
+  orchestrator mount a model cache it owns without `chown` games, but if your
+  policy forbids it, add a `USER` line and make `/cache/huggingface` writable.
+- **It declares no `VOLUME`**, so nothing is persisted unless you mount
+  `/cache/huggingface` yourself (the compose profiles and the GPUStack manifest
+  both do).
 
 ## Deploying on GPUStack
 
@@ -431,15 +810,17 @@ GPUStack expresses "CPU or GPU": scheduling is filtered by the version's
 framework, and `cpu` matches any worker while `cuda` matches only workers with
 an NVIDIA GPU.
 
-| Version | `custom_framework` | Env | Schedulable on |
+| Version | `custom_framework` | Env set by the version | Schedulable on |
 | --- | --- | --- | --- |
-| `1.0.0` | `cuda` | TF32 on, GPU batch window | GPU workers |
-| `1.0.0-cpu` | `cpu` | `DEVICE=cpu`, wider batch window | any worker, no GPU needed |
+| `1.0.0` | `cuda` | none — inherits `default_env` | GPU workers |
+| `1.0.0-cpu` | `cpu` | `DEVICE=cpu`, `MICROBATCH_SECONDS=0.25`, `MICROBATCH_MAX_WAIT_MS=10`, `MAX_QUEUE=256`, `SUBBATCH_SECONDS=30` | any worker, no GPU needed |
 
 Both point at the same image tag. The environment is the only difference, which
 is deliberate: the CPU path is the same code with the same single-pass model, so
-the image does not need to be built twice. GPUStack applies the version's `env`
-on top of `default_env`, and version-level values win.
+the image does not need to be built twice. The CUDA version sets no `env` of its
+own — `TF32` and the batch window come from the image defaults and the manifest's
+`default_env`. GPUStack applies a version's `env` on top of `default_env`, and
+version-level values win.
 
 The manifest also tells GPUStack to:
 
@@ -454,21 +835,31 @@ backends are single-worker deployments.
 
 ## GitLab CI
 
-`.gitlab-ci.yml` builds on tags matching `v-*-release` using the shared runner,
-so nothing is built for ordinary commits:
+`.gitlab-ci.yml` has three stages — `test`, `build-image`, `release` — and is
+gated on tags matching `v-*-release`:
 
 ```bash
 git tag v-1.0.0-release
 git push origin v-1.0.0-release
 ```
 
-That runs `ruff` and `pytest`, builds the image with BuildKit, and pushes
-`$CI_REGISTRY_IMAGE/asr-engine:$CI_COMMIT_TAG` plus `:latest` to the project
-registry, then opens a release with the changelog. Use the pushed image in
-`deploy/gpustack-backend.yaml`:
+- **`test`** runs on a plain `python:3.11-slim` image (installing `ruff`,
+  `pytest` and friends by hand — no torch, no model) and runs `ruff check app
+  tests scripts` then `pytest -q`. It also runs on **merge-request pipelines**,
+  so a MR is checked before it lands; pushes to ordinary branches do **not** run
+  it.
+- **`build-image`** builds with BuildKit (`--platform linux/amd64`, cudnn
+  runtime base, `INSTALL_LM=true` by default) and pushes both
+  `$CI_REGISTRY_IMAGE/asr-engine:$CI_COMMIT_TAG` and `:latest` to the project
+  registry, with a registry-backed layer cache.
+- **`release`** cuts a GitLab release whose description is the git log since the
+  previous tag.
+
+Use the pushed image in `deploy/gpustack-backend.yaml`, pointing `image_name`
+at the registry the tag was pushed to:
 
 ```yaml
-image_name: gitlab.huongnghiepaau.com:5050/dev/asr-engine/asr-engine:v-1.0.0-release
+image_name: $CI_REGISTRY_IMAGE/asr-engine:v-1.0.0-release
 ```
 
 One tag serves both backend versions: point the `1.0.0-cpu` version at the same
@@ -482,39 +873,66 @@ There is no deploy stage: GPUStack pulls the image itself when you deploy.
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[test]"
 
-pytest -q                     # ~94 tests, no GPU or model download needed
+pytest -q                     # 108 tests, no GPU or model download needed
 ruff check app tests scripts
 ruff format app tests scripts
 ```
 
 The tests monkeypatch a scripted fake engine into `app.server`, so they exercise
-the HTTP, SSE and WebSocket contracts without loading the model.
+the HTTP, SSE and WebSocket contracts without loading the model. They never
+import `torch` or `quan_transcribe`, which is why CI can run them on a plain
+Python image.
 
 To drive the real endpoints without downloading 356M parameters:
 
 ```bash
-python scripts/dev_server.py --port 8123   # stub engine, real ASGI stack
-./scripts/smoke.sh http://127.0.0.1:8123   # curl through every response format
+python scripts/dev_server.py --port 8123              # stub engine, real ASGI stack
+URL=http://127.0.0.1:8123 ./scripts/smoke.sh          # health + models + one transcribe + SSE
 python scripts/ws_probe.py --url ws://127.0.0.1:8123/v1/audio/transcriptions/stream
 ```
 
+`smoke.sh` takes the **audio file** as its first positional argument and the
+**URL** from the `URL` environment variable; it checks `/health` and
+`/v1/models` first so a failure points at the right layer.
 `scripts/make_sample_audio.py` writes a small tone/quiet WAV if you need a
 fixture. `scripts/ws_probe.py` streams that kind of audio over the live
 WebSocket and prints every event; it needs `websockets`, which `uvicorn[standard]`
 already pulls in.
 
+Two scripts answer "is this file badly transcribed, or is it just mostly
+silence?" — both run against the real model and the real recordings in
+`samples/`:
+
+```bash
+python scripts/probe_audio.py samples/*.mp3    # 100 ms RMS envelope, % speech, no model
+python scripts/repro_local.py samples/*.mp3    # per-segment text, VAD on vs off
+```
+
+`probe_audio.py` needs only ffmpeg, so it is the quick first look.
+`repro_local.py` loads the model, transcribes each file twice (VAD off, then on),
+and prints every segment with its timestamps, the joined transcript, the decode
+time and the time VAD saved. Inside the container:
+
+```bash
+docker run --rm --env-file .env -v "$PWD":/work -w /work \
+  -v quan-hf:/cache/huggingface -e HF_HOME=/cache/huggingface \
+  --entrypoint python quan-asr:1.0.0 scripts/repro_local.py samples/voicemail-90s.mp3
+```
+
 ### Layout
 
 ```
 app/config.py     settings, all env-driven
-app/audio.py      decode, resample, quiet-point splitting, segments
+app/audio.py      decode, resample, quiet-point and VAD-region splitting, segments
 app/formats.py    json/text/srt/vtt/verbose_json rendering
+app/vad.py        Silero voice activity detection (lazy, optional)
 app/core.py       the engine core: model-owning thread, priority + coalescing
 app/engine.py     model wrapper, streaming, live sessions, scheduler wiring
 app/schemas.py    request validation, OpenAI-shaped errors
 app/server.py     FastAPI routes, SSE, WebSocket
 app/ui.py         browser playground
 app/cli.py        `quan-asr` entrypoint
+app/__main__.py   `python -m app` shim
 ```
 
 Every model call goes through `app/core.py`, a single thread that owns the
@@ -527,4 +945,16 @@ kill the container — it surfaces through `/health` as `"error"`.
 ## Credits
 
 Model and reference implementation: [QUAN-Transcribe](https://github.com/qnguyen3/QUAN-Transcribe)
-by [qnguyen3](https://huggingface.co/qnguyen3).
+by [qnguyen3](https://huggingface.co/qnguyen3). The base audio encoder is
+Google's [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2).
+
+## Licence
+
+This server is released under **Apache-2.0** (see `pyproject.toml`).
+
+The **model weights are not** Apache-2.0: `QUAN-Transcribe-1.0` is a derivative
+of EmbeddingGemma 2 and is governed by the
+[Gemma Terms of Use](https://ai.google.dev/gemma/terms). Review those terms
+before using the model in production, and note that the gated
+`google/embeddinggemma-2` encoder requires accepting Google's licence before it
+can be downloaded.

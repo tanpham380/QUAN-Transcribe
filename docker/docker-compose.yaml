@@ -29,6 +29,9 @@ x-common: &common
     # Streaming lookback. 0 keeps latency flat; omit for best accuracy.
     LEFT_CHUNKS: ${LEFT_CHUNKS:-}
     LOG_LEVEL: ${LOG_LEVEL:-info}
+    # Silero VAD: skip decoding silence and cut pieces on real pauses. Off by
+    # default; the CPU profile below turns it on. Requires the 'vad' extra.
+    USE_VAD: ${USE_VAD:-false}
     # Uncomment to require a bearer token, like OpenAI's own API.
     # API_KEY: ${API_KEY:-}
   restart: unless-stopped
@@ -42,6 +45,10 @@ x-common: &common
 services:
   quan-asr-cuda:
     <<: *common
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: quan-asr:cuda
     profiles: ["gpu", "cuda"]
     container_name: quan-asr-cuda
     ports:
@@ -61,6 +68,10 @@ services:
 
   quan-asr-cpu:
     <<: *common
+    build:
+      context: ..
+      dockerfile: Dockerfile.cpu
+    image: quan-asr:cpu
     profiles: ["cpu"]
     container_name: quan-asr-cpu
     ports:
@@ -82,6 +93,9 @@ services:
       # live session until it finished; the cap gives the scheduler a point to
       # preempt at. 0 disables it (fine on GPU, where a pass is milliseconds).
       SUBBATCH_SECONDS: ${SUBBATCH_SECONDS:-30}
+      # CPU time is the scarce resource here, and call audio is mostly silence,
+      # so VAD pays for itself twice: less audio to decode and cuts on pauses.
+      USE_VAD: ${USE_VAD:-true}
       # Unset lets torch size itself to the visible cores. Set it when the
       # container is limited by a cgroup quota, e.g. CPU_THREADS=4.
       CPU_THREADS: ${CPU_THREADS:-}

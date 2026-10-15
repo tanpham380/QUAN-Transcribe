@@ -52,6 +52,8 @@ spec:
           # Cap each forward pass at 30 s of audio so a long file cannot stall
           # a live session: the scheduler can preempt between launches.
           SUBBATCH_SECONDS: "30"
+          # Call audio is mostly silence; VAD skips it and cuts on real pauses.
+          USE_VAD: "true"
         run_command: >-
           --model-path {{model_path}}
           --served-model-name {{model_name}}

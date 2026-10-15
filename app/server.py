@@ -28,6 +28,7 @@ import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -35,6 +36,7 @@ from fastapi import Depends, FastAPI, File, Form, Request, UploadFile, WebSocket
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
+    FileResponse,
     HTMLResponse,
     JSONResponse,
     PlainTextResponse,
@@ -55,6 +57,7 @@ from .audio import (
 from .config import Settings
 from .engine import EngineBusy, EngineNotReady, StreamEvent, TranscriptionEngine
 from .formats import MEDIA_TYPES, merge_segments_by_sentence, render
+from .postprocess import PostProcessor, default_post_processor, to_phonemes
 from .schemas import APIError, TranscriptionParams, parse_transcription_form
 from .ui import INDEX_HTML
 
@@ -96,9 +99,29 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     else:
         logger.info("preload disabled; the model loads on the first request")
 
+    grpc_server = None
+    if settings.grpc_port:
+        try:
+            from .grpc_server import create_grpc_server
+
+            grpc_server = create_grpc_server(
+                engine, host=settings.host, port=settings.grpc_port
+            )
+            grpc_server.start()
+            logger.info(
+                "gRPC speech service started on %s:%d",
+                settings.host,
+                settings.grpc_port,
+            )
+        except Exception as exc:
+            logger.error("failed to start gRPC service: %s", exc)
+
     try:
         yield
     finally:
+        if grpc_server:
+            grpc_server.stop(0)
+            logger.info("gRPC service stopped")
         engine.close()
         logger.info("shutdown complete")
 
@@ -147,9 +170,7 @@ async def _http_error_handler(_: Request, exc: StarletteHTTPException) -> JSONRe
 async def _validation_error_handler(
     _: Request, exc: RequestValidationError
 ) -> JSONResponse:
-    error = APIError(
-        f"invalid request: {exc.errors()}", code="invalid_request_body"
-    )
+    error = APIError(f"invalid request: {exc.errors()}", code="invalid_request_body")
     return JSONResponse(status_code=400, content=error.to_payload())
 
 
@@ -196,7 +217,9 @@ def _check_model(requested: str | None) -> None:
     accepted = {settings.served_model_name.lower(), settings.model_path.lower()}
     accepted |= _ALIASES
     # Also accept the basename of a local model directory.
-    accepted.add(settings.model_path.replace("\\", "/").rstrip("/").split("/")[-1].lower())
+    accepted.add(
+        settings.model_path.replace("\\", "/").rstrip("/").split("/")[-1].lower()
+    )
     if requested.strip().lower() not in accepted:
         raise APIError(
             f"the model '{requested}' does not exist; this server serves "
@@ -214,9 +237,7 @@ def _decode_upload(data: bytes) -> np.ndarray:
         raise APIError(str(exc), code="invalid_audio_file") from exc
     wav = to_16k_mono(wav, sr)
     if wav.size == 0:
-        raise APIError(
-            "the uploaded file contains no audio", code="invalid_audio_file"
-        )
+        raise APIError("the uploaded file contains no audio", code="invalid_audio_file")
     return wav
 
 
@@ -240,9 +261,71 @@ def _shape_segments(
 # --------------------------------------------------------------------------- #
 
 
+_ROOT_DIR = Path(__file__).resolve().parent.parent
+_SAMPLES_DIR = _ROOT_DIR / "samples"
+
+_SCALAR_HTML = """<!doctype html>
+<html lang="en">
+  <head>
+    <title>QUAN-ASR API Reference · Scalar</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%231a73e8'><path d='M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z'/></svg>" />
+    <style>body { margin: 0; }</style>
+  </head>
+  <body>
+    <script
+      id="api-reference"
+      data-url="/openapi.json"
+      data-configuration='{"theme": "kepler", "showSidebar": true, "defaultHttpClient": {"targetKey": "python", "clientKey": "requests"}}'
+      src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+  </body>
+</html>"""
+
+
 @app.get("/", include_in_schema=False)
 async def index() -> HTMLResponse:
     return HTMLResponse(INDEX_HTML)
+
+
+@app.get("/scalar", include_in_schema=False)
+async def scalar_docs() -> HTMLResponse:
+    return HTMLResponse(_SCALAR_HTML)
+
+
+@app.get("/samples", include_in_schema=False)
+async def list_samples() -> list[dict[str, Any]]:
+    samples = [
+        {
+            "id": "voicemail",
+            "name": "Voicemail nhà mạng (90s)",
+            "filename": "voicemail-90s.mp3",
+            "duration": "90.2s",
+            "size": "352 KB",
+        },
+        {
+            "id": "sales-call",
+            "name": "Cuộc gọi tư vấn (73s)",
+            "filename": "sales-call-72s.mp3",
+            "duration": "72.7s",
+            "size": "568 KB",
+        },
+    ]
+    return [s for s in samples if (_SAMPLES_DIR / s["filename"]).is_file()]
+
+
+@app.get("/samples/{filename}", include_in_schema=False)
+async def get_sample(filename: str) -> FileResponse:
+    allowed = {
+        "voicemail-90s.mp3",
+        "sales-call-72s.mp3",
+    }
+    if filename not in allowed:
+        raise StarletteHTTPException(status_code=404, detail="sample not found")
+    path = _SAMPLES_DIR / filename
+    if not path.is_file():
+        raise StarletteHTTPException(status_code=404, detail="sample file not found")
+    return FileResponse(path, media_type="audio/mpeg")
 
 
 @app.get("/health")
@@ -362,6 +445,16 @@ async def transcribe(
         raise APIError(str(exc), status_code=503, error_type="server_error") from exc
 
     segments = _shape_segments(segments, params)
+    processor = (
+        PostProcessor(norm_mode=params.norm_mode, enable_g2p=params.phonemes)
+        if (params.norm_mode != "itn" or params.phonemes)
+        else default_post_processor
+    )
+    if params.punctuate and settings.enable_punctuation:
+        segments = processor.process_segments(segments, include_phonemes=params.phonemes)
+    elif params.phonemes:
+        for seg in segments:
+            seg.phonemes = to_phonemes(seg.text)
     body = render(
         params.response_format,
         segments,
@@ -439,7 +532,16 @@ def _streaming_response(
                 if payload is None:
                     break
                 if payload.get("type") == "transcript.text.segment":
-                    finals.append(payload["text"])
+                    seg_text = payload["text"]
+                    if params.punctuate and settings.enable_punctuation:
+                        seg_text = default_post_processor.process(seg_text, is_final=False)
+                        payload["text"] = seg_text
+                    if params.phonemes and seg_text:
+                        payload["phonemes"] = to_phonemes(seg_text)
+                    finals.append(seg_text)
+                elif payload.get("type") == "transcript.text.delta":
+                    if params.phonemes and payload.get("text"):
+                        payload["phonemes"] = to_phonemes(payload["text"])
                 yield _sse(payload)
         except asyncio.CancelledError:
             # The client went away: stop decoding instead of running to the end
@@ -452,16 +554,21 @@ def _streaming_response(
 
         # A final summary event carrying the whole transcript, so a client that
         # only looks at the last event still gets the text.
-        yield _sse(
-            {
-                "type": "transcript.text.done",
-                "text": " ".join(t for t in finals if t).strip(),
-                "duration": round(duration, 3),
-                "model": model_name,
-                "language": "vi",
-                "elapsed": round(time.perf_counter() - started, 3),
-            }
-        )
+        full_transcript = " ".join(t for t in finals if t).strip()
+        if params.punctuate and settings.enable_punctuation and full_transcript:
+            full_transcript = default_post_processor.process(full_transcript, is_final=True)
+
+        done_event: dict[str, Any] = {
+            "type": "transcript.text.done",
+            "text": full_transcript,
+            "duration": round(duration, 3),
+            "model": model_name,
+            "language": "vi",
+            "elapsed": round(time.perf_counter() - started, 3),
+        }
+        if params.phonemes and full_transcript:
+            done_event["phonemes"] = to_phonemes(full_transcript)
+        yield _sse(done_event)
 
     return StreamingResponse(
         events(),
@@ -602,6 +709,19 @@ async def transcribe_stream(websocket: WebSocket) -> None:
         await websocket.close(code=1011)
         return
 
+    raw_punc = websocket.query_params.get("punctuate") or websocket.query_params.get("enable_punctuation")
+    should_punctuate = (
+        raw_punc.strip().lower() in ("1", "true", "yes", "on")
+        if raw_punc is not None
+        else settings.enable_punctuation
+    )
+    raw_phonemes = websocket.query_params.get("phonemes") or websocket.query_params.get("g2p")
+    include_phonemes = (
+        raw_phonemes.strip().lower() in ("1", "true", "yes", "on")
+        if raw_phonemes is not None
+        else False
+    )
+
     await websocket.send_json(
         {
             "type": "session.created",
@@ -613,6 +733,8 @@ async def transcribe_stream(websocket: WebSocket) -> None:
             "left_chunks": left_chunks,
             "use_lm": use_lm if use_lm is not None else settings.supports_lm,
             "beam_width": beam_width or settings.beam_width,
+            "punctuate": should_punctuate,
+            "phonemes": include_phonemes,
         }
     )
 
@@ -631,14 +753,20 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                 if command in {"stop", "flush", "eof"}:
                     final = await run_in_threadpool(live.flush)
                     if final:
-                        await websocket.send_json(
-                            {
-                                "type": "transcript.text.done",
-                                "text": final,
-                                "final": True,
-                                "end": round(live.consumed_seconds, 3),
-                            }
+                        final_text = (
+                            default_post_processor.process(final, is_final=True)
+                            if should_punctuate
+                            else final
                         )
+                        done_payload: dict[str, Any] = {
+                            "type": "transcript.text.done",
+                            "text": final_text,
+                            "final": True,
+                            "end": round(live.consumed_seconds, 3),
+                        }
+                        if include_phonemes and final_text:
+                            done_payload["phonemes"] = to_phonemes(final_text)
+                        await websocket.send_json(done_payload)
                     break
                 if command == "ping":
                     await websocket.send_json({"type": "pong"})
@@ -703,7 +831,18 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                 )
                 continue
             for event in events:
-                await websocket.send_json(_event_payload(event))
+                ev_payload = _event_payload(event)
+                if (
+                    event.kind in ("final", "done")
+                    and ev_payload.get("text")
+                    and should_punctuate
+                ):
+                    ev_payload["text"] = default_post_processor.process(
+                        ev_payload["text"], is_final=True
+                    )
+                if include_phonemes and ev_payload.get("text"):
+                    ev_payload["phonemes"] = to_phonemes(ev_payload["text"])
+                await websocket.send_json(ev_payload)
 
         await websocket.send_json({"type": "session.closed"})
     except Exception:

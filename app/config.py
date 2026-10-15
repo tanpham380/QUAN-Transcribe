@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, fields, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .vad import VadConfig
 
 DEFAULT_MODEL = "qnguyen3/QUAN-Transcribe-1.0"
 DEFAULT_SERVED_NAME = "QUAN-Transcribe-1.0"
@@ -88,6 +91,27 @@ class Settings:
     #: Long recordings are cut into pieces of at most this many seconds, at a
     #: quiet point, which also become the reported segments.
     chunk_seconds: float = 30.0
+
+    # --- voice activity detection -------------------------------------------
+    #: Skip decoding silence and cut pieces on real pauses instead of the
+    #: quietest 50 ms window. Real call audio is mostly silence (a measured
+    #: 90 s voicemail had 7 s of speech), so this is the single biggest win for
+    #: long recordings. See ``app/vad.py``. Requires the ``vad`` extra; when the
+    #: package is missing the server logs a warning and falls back to
+    #: energy-based splitting.
+    use_vad: bool = False
+    #: Speech probability above which a 32 ms window counts as speech.
+    vad_threshold: float = 0.5
+    #: Shortest run of speech worth keeping, and the silence that ends it (ms).
+    vad_min_speech_ms: int = 250
+    vad_min_silence_ms: int = 300
+    #: Padding around every speech region (ms). Silero defaults to 30 ms, which
+    #: clips the first syllable of a region for this encoder; 250 ms keeps it.
+    vad_speech_pad_ms: int = 250
+    #: When true, silence is dropped before decoding (faster, model returns ""
+    #: for it anyway). When false, silence is kept and VAD only supplies cut
+    #: points, which is bit-for-bit the VAD-less transcript.
+    vad_trim_silence: bool = True
     #: Padding budget per forward pass; lower it if you run out of VRAM.
     batch_seconds: float = 600.0
     #: Longest single forward pass, in audio seconds (the padded cost `k * n`).
@@ -132,18 +156,37 @@ class Settings:
     #: Reject streams longer than this, as a safety valve.
     max_stream_seconds: float = 3600.0
 
-    # --- http ----------------------------------------------------------------
+    # --- http & grpc ---------------------------------------------------------
     host: str = "0.0.0.0"
     port: int = 8000
+    grpc_port: int | None = None
     api_key: str | None = None
     cors_origins: tuple[str, ...] = ("*",)
     max_upload_mb: int = 200
     log_level: str = "info"
 
+    # --- enterprise postprocessing & multi-worker ----------------------------
+    enable_punctuation: bool = False
+    devices: tuple[str, ...] = ("auto",)
+
     @property
     def supports_lm(self) -> bool:
         """True when the deployment was asked to load a KenLM model."""
         return self.use_lm or bool(self.lm_path)
+
+    @property
+    def vad(self) -> VadConfig:
+        """The VAD tuning as a frozen :class:`~app.vad.VadConfig`."""
+        from .vad import VadConfig
+
+        return VadConfig(
+            enabled=self.use_vad,
+            threshold=self.vad_threshold,
+            min_speech_ms=self.vad_min_speech_ms,
+            min_silence_ms=self.vad_min_silence_ms,
+            speech_pad_ms=self.vad_speech_pad_ms,
+            trim_silence=self.vad_trim_silence,
+        )
 
     @property
     def lm_source(self) -> str:
@@ -198,6 +241,12 @@ class Settings:
             beam_width=_maybe_int("BEAM_WIDTH", 32) or 32,
             left_chunks=_maybe_int("LEFT_CHUNKS"),
             chunk_seconds=_maybe_float("CHUNK_SECONDS", 30.0) or 30.0,
+            use_vad=_flag("USE_VAD", False),
+            vad_threshold=_maybe_float("VAD_THRESHOLD", 0.5) or 0.5,
+            vad_min_speech_ms=_maybe_int("VAD_MIN_SPEECH_MS", 250) or 250,
+            vad_min_silence_ms=_maybe_int("VAD_MIN_SILENCE_MS", 300) or 300,
+            vad_speech_pad_ms=_maybe_int("VAD_SPEECH_PAD_MS", 250) or 0,
+            vad_trim_silence=_flag("VAD_TRIM_SILENCE", True),
             batch_seconds=_maybe_float("BATCH_SECONDS", 600.0) or 600.0,
             subbatch_seconds=_maybe_float("SUBBATCH_SECONDS", 0.0) or 0.0,
             microbatch_seconds=_maybe_float("MICROBATCH_SECONDS", 0.15) or 0.0,
@@ -215,10 +264,16 @@ class Settings:
             max_stream_seconds=_maybe_float("MAX_STREAM_SECONDS", 3600.0) or 3600.0,
             host=_get("HOST", "0.0.0.0"),
             port=_maybe_int("PORT", 8000) or 8000,
+            grpc_port=_maybe_int("GRPC_PORT"),
             api_key=_get("API_KEY"),
             cors_origins=tuple(o.strip() for o in origins.split(",") if o.strip()),
             max_upload_mb=_maybe_int("MAX_UPLOAD_MB", 200) or 200,
             log_level=(_get("LOG_LEVEL", "info") or "info").lower(),
+            enable_punctuation=_flag("PUNCTUATE", False),
+            devices=(
+                tuple(d.strip() for d in _get("DEVICES", "").split(",") if d.strip())
+                or (_maybe_str("DEVICE") or "auto",)
+            ),
         )
 
     def merge(self, **overrides: Any) -> Settings:

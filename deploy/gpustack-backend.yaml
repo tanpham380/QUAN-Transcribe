@@ -45,11 +45,12 @@ default_env:
   # LM_BETA: "1.0"      # word-insertion bonus; omit to use lm_config.json
   # BEAM_WIDTH: "32"    # beams kept by the beam search
   # LEFT_CHUNKS: "0"    # streaming lookback: 0 = lowest latency
+  # USE_VAD: "true"     # Silero VAD: skip silence, cut on real pauses
   # API_KEY: "sk-..."   # require a bearer token on every request
 version_configs:
   "1.0.0":
-    # Push the GitLab-built image and use its full path here, e.g.
-    # gitlab.huongnghiepaau.com:5050/dev/asr-engine/asr-engine:v-1.0.0-release
+    # Push the CI-built image (see .gitlab-ci.yml) and use its full path here,
+    # e.g. $CI_REGISTRY_IMAGE/asr-engine:v-1.0.0-release
     image_name: quan-asr:1.0.0
     custom_framework: cuda
     run_command: >-
@@ -75,6 +76,9 @@ version_configs:
       # Cap each forward pass at 30 s of audio so a long file cannot stall a
       # live session: the scheduler can preempt between launches.
       SUBBATCH_SECONDS: "30"
+      # Call audio is mostly silence; VAD skips it and cuts on real pauses,
+      # which is where CPU time is actually saved.
+      USE_VAD: "true"
       # Leave CPU_THREADS unset to let torch size itself to the visible cores;
       # set it when the container is limited by a cgroup quota, e.g. "4".
       # CPU_THREADS: "4"

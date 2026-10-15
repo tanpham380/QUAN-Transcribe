@@ -92,31 +92,37 @@ def to_verbose_json(
     model: str,
     task: str = "transcribe",
 ) -> dict[str, Any]:
-    return {
+    seg_list: list[dict[str, Any]] = []
+    for index, segment in enumerate(segments):
+        item: dict[str, Any] = {
+            "id": index,
+            "seek": 0,
+            "start": round(segment.start, 3),
+            "end": round(segment.end, 3),
+            "text": f" {segment.text}" if segment.text else "",
+            "tokens": [],
+            "temperature": 0.0,
+            "avg_logprob": 0.0,
+            "compression_ratio": 1.0,
+            "no_speech_prob": 0.0,
+        }
+        if getattr(segment, "phonemes", None):
+            item["phonemes"] = segment.phonemes
+        seg_list.append(item)
+
+    payload: dict[str, Any] = {
         "task": task,
         "language": language,
         "duration": round(duration, 3),
         "text": transcript_text(segments),
-        "segments": [
-            {
-                "id": index,
-                "seek": 0,
-                "start": round(segment.start, 3),
-                "end": round(segment.end, 3),
-                # OpenAI prefixes segment text with a space; clients rely on it
-                # when concatenating segments.
-                "text": f" {segment.text}" if segment.text else "",
-                "tokens": [],
-                "temperature": 0.0,
-                "avg_logprob": 0.0,
-                "compression_ratio": 1.0,
-                "no_speech_prob": 0.0,
-            }
-            for index, segment in enumerate(segments)
-        ],
+        "segments": seg_list,
         "words": [],
         "model": model,
     }
+    all_phonemes = " ".join(s.phonemes for s in segments if getattr(s, "phonemes", None)).strip()
+    if all_phonemes:
+        payload["phonemes"] = all_phonemes
+    return payload
 
 
 def render(
@@ -148,7 +154,11 @@ def render(
             ensure_ascii=False,
         )
     if fmt == "json":
-        return json.dumps({"text": transcript_text(segments)}, ensure_ascii=False)
+        data: dict[str, Any] = {"text": transcript_text(segments)}
+        all_phonemes = " ".join(s.phonemes for s in segments if getattr(s, "phonemes", None)).strip()
+        if all_phonemes:
+            data["phonemes"] = all_phonemes
+        return json.dumps(data, ensure_ascii=False)
     raise ValueError(f"unsupported response_format: {response_format!r}")
 
 
