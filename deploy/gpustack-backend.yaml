@@ -50,8 +50,8 @@ default_env:
 version_configs:
   "1.0.0":
     # Push the CI-built images (see .gitlab-ci.yml) and use their full path here,
-    # e.g. $CI_REGISTRY_IMAGE/quan-asr-server:v-1.0.0-release-gpu
-    image_name: quan-asr-server:v-1.0.0-release-gpu
+    # e.g. $CI_REGISTRY_IMAGE/quan-asr-server:v1.0.0-release-gpu
+    image_name: quan-asr-server:v1.0.0-release-gpu
     custom_framework: cuda
     run_command: >-
       --model-path {{model_path}}
@@ -59,8 +59,8 @@ version_configs:
       --host {{worker_ip}}
       --port {{port}}
   "1.0.0-cpu":
-    # e.g. $CI_REGISTRY_IMAGE/quan-asr-server:v-1.0.0-release-cpu
-    image_name: quan-asr-server:v-1.0.0-release-cpu
+    # e.g. $CI_REGISTRY_IMAGE/quan-asr-server:v1.0.0-release-cpu
+    image_name: quan-asr-server:v1.0.0-release-cpu
     custom_framework: cpu
     # CPU image: built from Dockerfile.cpu (torch CPU wheels), DEVICE=cpu is the
     # image default; the device is pinned here too so a machine that happens to
