@@ -103,7 +103,7 @@ ENV HF_HOME=/cache/huggingface \
     OMP_NUM_THREADS=8
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=900s --retries=5 \
-    CMD curl -fsS http://127.0.0.1:${PORT}/health || exit 1
+    CMD curl -fsS http://127.0.0.1:${PORT}/ready || exit 1
 
 EXPOSE 8000
 

@@ -88,14 +88,19 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         settings.device or "auto",
         settings.preload,
     )
+    preload_task: asyncio.Task[None] | None = None
     if settings.preload:
-        try:
-            await run_in_threadpool(engine.load)
-            await run_in_threadpool(engine.warmup)
-        except EngineNotReady as exc:
-            # Do not crash the container: /health reports the failure so an
-            # operator can fix the cause (token, disk, GPU) and restart.
-            logger.error("model preload failed: %s", exc)
+        async def _preload_model() -> None:
+            try:
+                await run_in_threadpool(engine.load)
+                await run_in_threadpool(engine.warmup)
+                logger.info("model preload and warmup complete; engine is ready")
+            except EngineNotReady as exc:
+                # Do not crash the container: /health reports the failure so an
+                # operator can fix the cause (token, disk, GPU) and restart.
+                logger.error("model preload failed: %s", exc)
+
+        preload_task = asyncio.create_task(_preload_model())
     else:
         logger.info("preload disabled; the model loads on the first request")
 
@@ -119,6 +124,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        if preload_task and not preload_task.done():
+            preload_task.cancel()
         if grpc_server:
             grpc_server.stop(0)
             logger.info("gRPC service stopped")
@@ -329,23 +336,54 @@ async def get_sample(filename: str) -> FileResponse:
 
 
 @app.get("/health")
-async def health(response: Response) -> dict[str, Any]:
+async def health(response: Response, ready: bool = False) -> dict[str, Any]:
     info = engine.info()
     loaded = bool(info["loaded"])
-    # While the weights are still downloading, report 200 + "loading" so the
-    # probe does not flap. Only a hard failure is a 503.
-    if not loaded and info["load_error"]:
+    is_ready = bool(info.get("ready", loaded and not info.get("load_error")))
+    # If caller specifically requested readiness check (e.g. ?ready=true) or there's a hard error:
+    if (not loaded and info["load_error"]) or (ready and not is_ready):
         response.status_code = 503
     return {
-        "status": "ok" if loaded else ("error" if info["load_error"] else "loading"),
+        "status": "ok" if is_ready else ("error" if info["load_error"] else "loading"),
         "model": info["model"],
         "device": (
             engine.describe_device() if loaded else (settings.device or "unknown")
         ),
         "language": "vi",
         "loaded": loaded,
+        "loading": bool(info.get("loading", False)),
+        "ready": is_ready,
         "error": info["load_error"],
     }
+
+
+@app.get("/ready", include_in_schema=False)
+@app.get("/readyz", include_in_schema=False)
+async def ready_probe(response: Response) -> dict[str, Any]:
+    """Readiness probe: returns 200 when model is loaded and ready, 503 when loading or failed."""
+    info = engine.info()
+    loaded = bool(info["loaded"])
+    is_ready = bool(info.get("ready", loaded and not info.get("load_error")))
+    if not is_ready:
+        response.status_code = 503
+        return {
+            "ready": False,
+            "status": "error" if info["load_error"] else "loading",
+            "error": info["load_error"],
+            "message": (
+                f"model failed to load: {info['load_error']}"
+                if info["load_error"]
+                else f"model '{settings.served_model_name}' is currently loading weights"
+            ),
+        }
+    return {"ready": True, "status": "ok", "model": settings.served_model_name}
+
+
+@app.get("/live", include_in_schema=False)
+@app.get("/livez", include_in_schema=False)
+async def live_probe() -> dict[str, Any]:
+    """Liveness probe: returns 200 if the server process is responsive."""
+    return {"live": True, "status": "ok"}
 
 
 @app.get("/metrics")
@@ -402,6 +440,22 @@ async def transcribe(
             f"one of {', '.join(MEDIA_TYPES)}",
             param="response_format",
             code="invalid_value",
+        )
+
+    # Readiness guard: reject immediately if model is not loaded
+    if not engine.is_loaded:
+        if engine.load_error:
+            raise APIError(
+                f"Model failed to load: {engine.load_error}",
+                status_code=503,
+                code="model_load_error",
+                error_type="server_error",
+            )
+        raise APIError(
+            f"Model '{settings.served_model_name}' is currently loading weights. Please wait a moment and retry.",
+            status_code=503,
+            code="model_loading",
+            error_type="server_error",
         )
 
     data = await file.read()
@@ -612,6 +666,25 @@ async def transcribe_stream(websocket: WebSocket) -> None:
         Accepted as an alternative to the ``Authorization`` header.
     """
     await websocket.accept()
+
+    if not engine.is_loaded:
+        msg = (
+            f"Model failed to load: {engine.load_error}"
+            if engine.load_error
+            else f"Model '{settings.served_model_name}' is currently loading weights. Please retry shortly."
+        )
+        await websocket.send_json(
+            {
+                "type": "error",
+                "error": {
+                    "message": msg,
+                    "type": "server_error",
+                    "code": "model_loading" if not engine.load_error else "model_load_error",
+                },
+            }
+        )
+        await websocket.close(code=1013)
+        return
 
     if settings.api_key:
         header = websocket.headers.get("authorization", "")

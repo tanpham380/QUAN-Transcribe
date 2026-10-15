@@ -35,6 +35,14 @@ class SpeechServicer(speech_pb2_grpc.SpeechServicer):
         self, request: speech_pb2.RecognizeRequest, context: grpc.ServicerContext
     ) -> speech_pb2.RecognizeResponse:
         """Single-shot file recognition."""
+        if not self.engine.is_loaded:
+            err_msg = (
+                f"model failed to load: {self.engine.load_error}"
+                if self.engine.load_error
+                else "model is currently loading weights, please retry shortly"
+            )
+            context.abort(grpc.StatusCode.UNAVAILABLE, err_msg)
+
         if not request.audio_content:
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "audio_content is empty")
 
@@ -87,6 +95,14 @@ class SpeechServicer(speech_pb2_grpc.SpeechServicer):
         context: grpc.ServicerContext,
     ) -> Iterator[speech_pb2.StreamingRecognizeResponse]:
         """Google Cloud Speech-style bidirectional audio streaming."""
+        if not self.engine.is_loaded:
+            err_msg = (
+                f"model failed to load: {self.engine.load_error}"
+                if self.engine.load_error
+                else "model is currently loading weights, please retry shortly"
+            )
+            context.abort(grpc.StatusCode.UNAVAILABLE, err_msg)
+
         config: speech_pb2.StreamingRecognitionConfig | None = None
         live = None
         enable_punc = True

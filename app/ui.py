@@ -208,6 +208,120 @@ INDEX_HTML = r"""<!doctype html>
     50% { transform: scale(1.3); opacity: 1; }
   }
 
+  @keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+  }
+  .spin {
+    animation: spin 1s linear infinite;
+    display: inline-block;
+  }
+
+  /* Model Status Banners */
+  .model-banner-container {
+    max-width: 1200px;
+    width: 100%;
+    margin: 16px auto 0 auto;
+    padding: 0 24px;
+    box-sizing: border-box;
+  }
+  .model-banner-card {
+    border-radius: 14px;
+    padding: 16px 20px;
+    display: flex;
+    align-items: flex-start;
+    gap: 16px;
+    box-shadow: var(--md-shadow-1);
+    position: relative;
+    overflow: hidden;
+    transition: all 0.3s ease;
+  }
+  .banner-card-loading {
+    background: rgba(26, 115, 232, 0.08);
+    border: 1px solid rgba(26, 115, 232, 0.35);
+  }
+  [data-theme="dark"] .banner-card-loading {
+    background: rgba(138, 180, 248, 0.08);
+    border: 1px solid rgba(138, 180, 248, 0.3);
+  }
+  .banner-card-error {
+    background: rgba(234, 67, 53, 0.08);
+    border: 1px solid rgba(234, 67, 53, 0.35);
+  }
+  .banner-icon-col {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding-top: 2px;
+  }
+  .banner-spinner {
+    width: 24px;
+    height: 24px;
+    border: 3px solid rgba(26, 115, 232, 0.2);
+    border-top-color: var(--google-blue);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  [data-theme="dark"] .banner-spinner {
+    border: 3px solid rgba(138, 180, 248, 0.2);
+    border-top-color: var(--md-primary);
+  }
+  .banner-body {
+    flex: 1;
+    min-width: 0;
+  }
+  .banner-headline {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 6px;
+    flex-wrap: wrap;
+  }
+  .banner-title {
+    font-family: 'Google Sans', sans-serif;
+    font-weight: 700;
+    font-size: 15px;
+    color: var(--md-text);
+  }
+  .banner-description {
+    font-size: 13px;
+    color: var(--md-text-secondary);
+    line-height: 1.45;
+  }
+  .banner-progress-track {
+    margin-top: 10px;
+    height: 4px;
+    width: 100%;
+    background: rgba(26, 115, 232, 0.15);
+    border-radius: 2px;
+    overflow: hidden;
+    position: relative;
+  }
+  .banner-progress-bar {
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    width: 35%;
+    background: var(--google-blue);
+    border-radius: 2px;
+    animation: banner-progress 1.6s infinite ease-in-out;
+  }
+  @keyframes banner-progress {
+    0% { left: -35%; }
+    50% { left: 40%; width: 50%; }
+    100% { left: 100%; width: 25%; }
+  }
+  .sample-chip.disabled-loading {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  #micBtn.disabled-loading {
+    opacity: 0.45;
+    cursor: not-allowed;
+    filter: grayscale(0.6);
+  }
+
   .nav-btn {
     display: inline-flex;
     align-items: center;
@@ -932,6 +1046,48 @@ INDEX_HTML = r"""<!doctype html>
 </header>
 
 <main>
+  <!-- Model Loading Banner -->
+  <div class="model-banner-container" id="modelLoadingBanner" style="display:none;">
+    <div class="model-banner-card banner-card-loading">
+      <div class="banner-icon-col">
+        <div class="banner-spinner"></div>
+      </div>
+      <div class="banner-body">
+        <div class="banner-headline">
+          <span class="banner-title">Mô hình AI đang khởi tạo trọng số...</span>
+          <span class="badge status-loading" id="bannerProgressBadge">Đang tải weights (~1.4 GB)</span>
+        </div>
+        <div class="banner-description" id="bannerDescText">
+          Hệ thống đang tải và giải mã trọng số mô hình <strong>QUAN-Transcribe-1.0</strong> cùng Google Gemma Audio Encoder. Các tính năng nhận diện tệp, phát trực tiếp SSE và Microphone tạm thời được khóa để tránh quá tải. Trang demo sẽ tự động sẵn sàng ngay khi nạp xong!
+        </div>
+        <div class="banner-progress-track">
+          <div class="banner-progress-bar"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Model Error Banner -->
+  <div class="model-banner-container" id="modelErrorBanner" style="display:none;">
+    <div class="model-banner-card banner-card-error">
+      <div class="banner-icon-col">
+        <span class="icon" style="font-size:28px; color:var(--google-red);">error</span>
+      </div>
+      <div class="banner-body">
+        <div class="banner-headline">
+          <span class="banner-title" style="color:var(--google-red);">Không thể nạp mô hình ASR</span>
+          <span class="badge status-error">Lỗi khởi động</span>
+        </div>
+        <div class="banner-description" id="bannerErrorDetails">
+          Đã xảy ra lỗi trong quá trình nạp trọng số mô hình. Vui lòng kiểm tra kết nối mạng đến Hugging Face hoặc biến môi trường HF_TOKEN.
+        </div>
+      </div>
+      <button class="btn btn-outlined" onclick="refreshHealth()" style="align-self:center;">
+        <span class="icon">refresh</span> Thử lại
+      </button>
+    </div>
+  </div>
+
   <!-- Google Standard Navigation Tabs -->
   <nav class="google-tabs" role="tablist">
     <button class="tab-item active" data-tab="fileTab">

@@ -75,6 +75,7 @@ class TranscriptionEngine:
         self.requests = 0
         self.audio_seconds = 0.0
         self.decode_seconds = 0.0
+        self._is_loading: bool = False
         # The one thread that touches the model. Created on load, once the
         # sample-rate-derived budget can be trusted, and always present: even a
         # single request runs through it, so there is exactly one code path.
@@ -88,6 +89,14 @@ class TranscriptionEngine:
     @property
     def is_loaded(self) -> bool:
         return self._asr is not None
+
+    @property
+    def is_loading(self) -> bool:
+        return self._is_loading
+
+    @property
+    def is_ready(self) -> bool:
+        return self._asr is not None and self._load_error is None
 
     @property
     def load_error(self) -> str | None:
@@ -109,8 +118,12 @@ class TranscriptionEngine:
                 return self._asr
             if self._load_error is not None:
                 raise EngineNotReady(self._load_error)
-            self._asr = self._load()
-            return self._asr
+            self._is_loading = True
+            try:
+                self._asr = self._load()
+                return self._asr
+            finally:
+                self._is_loading = False
 
     def _ensure_core(self) -> EngineCore:
         """Return the model thread, starting it exactly once.
@@ -256,6 +269,8 @@ class TranscriptionEngine:
             "model": self.settings.served_model_name,
             "model_path": self.settings.model_path,
             "loaded": self.is_loaded,
+            "loading": self._is_loading,
+            "ready": self.is_ready,
             "device": device,
             "profile": self.settings.profile,
             "language": "vi",
