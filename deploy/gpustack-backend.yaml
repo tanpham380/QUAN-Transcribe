@@ -42,7 +42,7 @@
 # already local, the server never downloads it again.
 
 backend_name: QUAN-ASR-Server-custom
-default_version: "1.0.0"
+default_version: "1.0.1"
 health_check_path: /health
 description: >-
   QUAN-Transcribe-1.0 Vietnamese ASR with an OpenAI-compatible transcription API,
@@ -61,6 +61,29 @@ default_env:
   # USE_VAD: "true"     # Silero VAD: skip silence, cut on real pauses
   # API_KEY: "sk-..."   # require a bearer token on every request
 version_configs:
+  "1.0.1":
+    image_name: registry.huongnghiepaau.com/dev/asr-engine/quan-asr-server:v1.0.1-release-gpu
+    custom_framework: cuda
+    run_command: >-
+      --model-path {{model_path}}
+      --served-model-name {{model_name}}
+      --host {{worker_ip}}
+      --port {{port}}
+  "1.0.1-cpu":
+    image_name: registry.huongnghiepaau.com/dev/asr-engine/quan-asr-server:v1.0.1-release-cpu
+    custom_framework: cpu
+    env:
+      DEVICE: cpu
+      MICROBATCH_SECONDS: "0.25"
+      MICROBATCH_MAX_WAIT_MS: "10"
+      MAX_QUEUE: "256"
+      SUBBATCH_SECONDS: "30"
+      USE_VAD: "true"
+    run_command: >-
+      --model-path {{model_path}}
+      --served-model-name {{model_name}}
+      --host {{worker_ip}}
+      --port {{port}}
   "1.0.0":
     # Fully qualified registry path. GPUStack runs this verbatim as
     # `docker pull <image_name>` and never prepends `--system-default-container-registry`,
