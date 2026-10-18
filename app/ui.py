@@ -2040,7 +2040,9 @@ btnStream.onclick = async () => {
       for (const frame of frames) {
         const line = frame.split('\n').find((l) => l.startsWith('data: '));
         if (!line) continue;
-        const payload = JSON.parse(line.slice(6));
+        const rawData = line.slice(6).trim();
+        if (rawData === '[DONE]') continue;
+        const payload = JSON.parse(rawData);
         $('rawView').textContent += JSON.stringify(payload) + '\n';
 
         if (payload.type === 'transcript.text.delta') {

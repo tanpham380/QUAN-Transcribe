@@ -432,14 +432,28 @@ async def transcribe(
     # shared validator turns it into OpenAI-shaped errors for everything else.
     form = await request.form()
     params = parse_transcription_form(form)
-    # The typed declarations are authoritative for the fields they cover.
-    params.streaming = bool(stream) or params.streaming
-    params.streaming_partials = bool(stream_partials)
-    params.response_format = (response_format or "json").strip().lower()
-    if language:
-        params.language = language.strip().lower().split("-")[0]
 
-    _check_model(model or form.get("model"))
+    # Support stream flag from Form, URL Query params (e.g. ?stream=true / ?enable_streaming=true)
+    query_stream = (
+        request.query_params.get("stream", "").strip().lower() in ("true", "1", "yes", "on")
+        or request.query_params.get("enable_streaming", "").strip().lower() in ("true", "1", "yes", "on")
+    )
+    form_stream = False
+    if form.get("enable_streaming") not in (None, ""):
+        form_stream = str(form.get("enable_streaming")).strip().lower() in ("true", "1", "yes", "on")
+
+    # The typed declarations are authoritative for the fields they cover.
+    params.streaming = bool(stream) or params.streaming or query_stream or form_stream
+    params.streaming_partials = bool(stream_partials)
+    params.response_format = (
+        response_format or form.get("response_format") or request.query_params.get("response_format") or "json"
+    ).strip().lower()
+
+    effective_language = language or form.get("language") or request.query_params.get("language")
+    if effective_language:
+        params.language = str(effective_language).strip().lower().split("-")[0].split("_")[0]
+
+    _check_model(model or form.get("model") or request.query_params.get("model"))
     if params.response_format not in MEDIA_TYPES:
         raise APIError(
             f"'{params.response_format}' is not a valid response_format; choose "
@@ -542,6 +556,9 @@ def _event_payload(event: StreamEvent) -> dict[str, Any]:
     }
     payload = event.as_dict()
     payload["type"] = kind_to_type.get(event.kind, event.kind)
+    # Compatibility fields for GPUStack UI & standard OpenAI streaming clients:
+    payload["delta"] = event.text
+    payload["choices"] = [{"delta": {"content": event.text}, "index": 0}]
     return payload
 
 
@@ -621,6 +638,8 @@ def _streaming_response(
         done_event: dict[str, Any] = {
             "type": "transcript.text.done",
             "text": full_transcript,
+            "delta": "",
+            "choices": [{"delta": {"content": ""}, "finish_reason": "stop", "index": 0}],
             "duration": round(duration, 3),
             "model": model_name,
             "language": "vi",
@@ -629,15 +648,19 @@ def _streaming_response(
         if params.phonemes and full_transcript:
             done_event["phonemes"] = to_phonemes(full_transcript)
         yield _sse(done_event)
+        # Standard OpenAI stream termination marker required by GPUStack & client parsers
+        yield "data: [DONE]\n\n"
 
     return StreamingResponse(
         events(),
         media_type="text/event-stream",
         headers={
+            "Content-Type": "text/event-stream; charset=utf-8",
             "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
             # Ask nginx and friends not to buffer, which would defeat streaming.
             "X-Accel-Buffering": "no",
+            "Transfer-Encoding": "chunked",
         },
     )
 
