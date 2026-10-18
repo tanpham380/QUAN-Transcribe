@@ -1,4 +1,4 @@
-# Two profiles for the two deployment shapes:
+# Two profiles, matching the two GPUStack backend versions:
 #
 #   docker compose --profile gpu up     # NVIDIA GPU
 #   docker compose --profile cpu up     # CPU only, no GPU reservation

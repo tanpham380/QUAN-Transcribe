@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quan-transcribe"
-version = "1.0.0"
+version = "1.0.1"
 description = "Fast Vietnamese speech recognition (offline and streaming) on EmbeddingGemma 2, plus an OpenAI-compatible serving layer"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -1,0 +1,128 @@
+# GPUStack custom inference backend for QUAN-ASR Server.
+#
+# Import it on the Inference Backends page ("Add Backend" -> paste YAML) after
+# pushing the image. The name must end with "-custom".
+#
+# Two versions are declared so the same backend serves both worker profiles,
+# which is how GPUStack expresses "CPU or GPU": scheduling is filtered by the
+# version's framework, and "cpu" is accepted on any worker while "cuda" only
+# matches workers with an NVIDIA GPU.
+#
+#   version 1.0.0      framework cuda  -> scheduled onto GPU workers
+#   version 1.0.0-cpu  framework cpu   -> scheduled onto CPU-only workers
+#
+# The two differ only in the environment block: the CPU version pins the device
+# to the CPU and widens the micro-batch window, because on CPU the model is a
+# plain FP32 GEMM pipeline where throughput comes from batching and thread
+# count rather than from a fast device.
+#
+# How the pieces fit together:
+#   image_name       the image built from this repository's Dockerfile. It must
+#                    be FULLY QUALIFIED (registry host + project path), because
+#                    GPUStack passes it to `docker pull` verbatim: a bare name
+#                    would be resolved against Docker Hub.
+#   run_command      appended to the image ENTRYPOINT (["quan-asr-server", "--serve"]),
+#                    with {{model_path}}, {{model_name}}, {{port}} and
+#                    {{worker_ip}} substituted by GPUStack at deploy time
+#   custom_framework which workers can schedule this deployment onto
+#   health_check_path which route the worker polls to decide "model is ready"
+#
+# Pulling from the private registry: `docker pull` runs on the worker, which
+# needs credentials for registry.huongnghiepaau.com or the deployment fails with
+# "unauthorized". Either log in on the worker host once:
+#   docker login registry.huongnghiepaau.com
+# or, when GPUStack performs the pull, start the worker with
+#   GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY_USERNAME=<user>
+#   GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY_PASSWORD=<token>
+# Use a read-only deploy token and pass it via the environment, not in this
+# file.
+#
+# GPUStack mounts the downloaded model at {{model_path}} and passes it on the
+# command line, which this server accepts as --model-path. Because the model is
+# already local, the server never downloads it again.
+
+backend_name: QUAN-ASR-Server-custom
+default_version: "1.0.1"
+health_check_path: /health
+description: >-
+  QUAN-Transcribe-1.0 Vietnamese ASR with an OpenAI-compatible transcription API,
+  SSE streaming and WebSocket live transcription. Ships a CUDA version and a
+  CPU-only version.
+default_env:
+  PRELOAD: "true"
+  HF_HOME: /cache/huggingface
+  LOG_LEVEL: info
+  # Set these to match your deployment:
+  # USE_LM: "true"      # 4-gram KenLM beam search, lower WER, CPU-bound
+  # LM_ALPHA: "0.3"     # LM weight; omit to use the value in lm_config.json
+  # LM_BETA: "1.0"      # word-insertion bonus; omit to use lm_config.json
+  # BEAM_WIDTH: "32"    # beams kept by the beam search
+  # LEFT_CHUNKS: "0"    # streaming lookback: 0 = lowest latency
+  # USE_VAD: "true"     # Silero VAD: skip silence, cut on real pauses
+  # API_KEY: "sk-..."   # require a bearer token on every request
+version_configs:
+  "1.0.1":
+    image_name: registry.huongnghiepaau.com/dev/asr-engine/quan-asr-server:v1.0.1-release-gpu
+    custom_framework: cuda
+    run_command: >-
+      --model-path {{model_path}}
+      --served-model-name {{model_name}}
+      --host {{worker_ip}}
+      --port {{port}}
+  "1.0.1-cpu":
+    image_name: registry.huongnghiepaau.com/dev/asr-engine/quan-asr-server:v1.0.1-release-cpu
+    custom_framework: cpu
+    env:
+      DEVICE: cpu
+      MICROBATCH_SECONDS: "0.25"
+      MICROBATCH_MAX_WAIT_MS: "10"
+      MAX_QUEUE: "256"
+      SUBBATCH_SECONDS: "30"
+      USE_VAD: "true"
+    run_command: >-
+      --model-path {{model_path}}
+      --served-model-name {{model_name}}
+      --host {{worker_ip}}
+      --port {{port}}
+  "1.0.0":
+    # Fully qualified registry path. GPUStack runs this verbatim as
+    # `docker pull <image_name>` and never prepends `--system-default-container-registry`,
+    # so a bare name like `quan-asr-server:...` would resolve to Docker Hub and
+    # fail. This is exactly $CI_REGISTRY_IMAGE/quan-asr-server:<tag>-gpu.
+    image_name: registry.huongnghiepaau.com/dev/asr-engine/quan-asr-server:v1.0.0-release-gpu
+    custom_framework: cuda
+    run_command: >-
+      --model-path {{model_path}}
+      --served-model-name {{model_name}}
+      --host {{worker_ip}}
+      --port {{port}}
+  "1.0.0-cpu":
+    # Same image path, CPU build ($CI_REGISTRY_IMAGE/quan-asr-server:<tag>-cpu).
+    image_name: registry.huongnghiepaau.com/dev/asr-engine/quan-asr-server:v1.0.0-release-cpu
+    custom_framework: cpu
+    # CPU image: built from Dockerfile.cpu (torch CPU wheels), DEVICE=cpu is the
+    # image default; the device is pinned here too so a machine that happens to
+    # have a GPU is still driven on the CPU when this version is chosen.
+    env:
+      DEVICE: cpu
+      # CPU decoding is one FP32 GEMM pipeline per core, so coalescing buys
+      # little throughput; keep the gather window short.
+      MICROBATCH_SECONDS: "0.25"
+      MICROBATCH_MAX_WAIT_MS: "10"
+      # Bounded decode queue: a full queue returns 503 instead of growing
+      # latency without limit. 0 disables the cap.
+      MAX_QUEUE: "256"
+      # Cap each forward pass at 30 s of audio so a long file cannot stall a
+      # live session: the scheduler can preempt between launches.
+      SUBBATCH_SECONDS: "30"
+      # Call audio is mostly silence; VAD skips it and cuts on real pauses,
+      # which is where CPU time is actually saved.
+      USE_VAD: "true"
+      # Leave CPU_THREADS unset to let torch size itself to the visible cores;
+      # set it when the container is limited by a cgroup quota, e.g. "4".
+      # CPU_THREADS: "4"
+    run_command: >-
+      --model-path {{model_path}}
+      --served-model-name {{model_name}}
+      --host {{worker_ip}}
+      --port {{port}}

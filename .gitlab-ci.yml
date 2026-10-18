@@ -1,0 +1,122 @@
+# GitLab CI for the QUAN-ASR Server images.
+#
+# Builds and pushes TWO container images to the GitLab Container Registry, and
+# cuts a GitLab Release. There is deliberately no deploy stage: these images are
+# pulled by GPUStack, not run from a compose file on a deploy host.
+#
+#   build_gpu  ->  Dockerfile      (nvidia/cuda base, torch cu126)  => :<tag>-gpu
+#   build_cpu  ->  Dockerfile.cpu  (python:3.11-slim, torch cpu)    => :<tag>-cpu
+#
+# Triggers: a tag matching v-<something>-release (e.g. v1.0.0-release).
+# The build runs on the shared docker runner.
+
+stages:
+  - build-image
+  - release
+
+variables:
+  # Pushed as $CI_REGISTRY_IMAGE/quan-asr-server:<tag>-gpu (and -cpu).
+  IMAGE_NAME: "$CI_REGISTRY_IMAGE/quan-asr-server"
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+  # kenlm has no wheel and is compiled from source inside the image. Set this to
+  # "false" to skip it: the build gets much faster and the server then only does
+  # greedy decoding (USE_LM must stay unset/false at runtime).
+  INSTALL_LM: "true"
+  # silero-vad + onnxruntime. Required by the CPU profiles, which set USE_VAD.
+  INSTALL_VAD: "true"
+  # Base CUDA runtime the GPU image is built on. Keep TORCH_INDEX in step with it.
+  CUDA: "12.6.1"
+  TORCH_INDEX: "https://download.pytorch.org/whl/cu126"
+  PYTHON_VERSION: "3.11"
+
+# Shared setup for both image builds. Each job overrides DOCKERFILE / VERSION_SUFFIX.
+.image_build:
+  stage: build-image
+  image: docker:28.3
+  services:
+    - docker:28.3-dind
+  tags:
+    - docker-execuse-150
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v-?.*-release$/'
+      when: on_success
+    - when: never
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+    - docker buildx create --use --name quan-builder --driver-opt image=moby/buildkit:v0.12.5 || docker buildx use quan-builder
+  script:
+    - |
+      docker buildx build \
+        --platform linux/amd64 \
+        --build-arg CUDA=$CUDA \
+        --build-arg TORCH_INDEX=$TORCH_INDEX \
+        --build-arg PYTHON_VERSION=$PYTHON_VERSION \
+        --build-arg INSTALL_LM=$INSTALL_LM \
+        --build-arg INSTALL_VAD=$INSTALL_VAD \
+        --cache-from=type=registry,ref=$BUILDX_CACHE \
+        --cache-to=type=registry,mode=max,ref=$BUILDX_CACHE \
+        -t "$IMAGE_NAME:$CI_COMMIT_TAG$VERSION_SUFFIX" \
+        -t "$IMAGE_NAME:latest$VERSION_SUFFIX" \
+        --push \
+        -f "$DOCKERFILE" .
+    - echo "Pushed $IMAGE_NAME:$CI_COMMIT_TAG$VERSION_SUFFIX"
+  after_script:
+    - docker buildx rm quan-builder || true
+
+build_gpu:
+  extends: .image_build
+  variables:
+    DOCKERFILE: Dockerfile
+    VERSION_SUFFIX: "-gpu"
+    BUILDX_CACHE: "$CI_REGISTRY_IMAGE/quan-asr-server-cache:buildx-gpu"
+
+build_cpu:
+  extends: .image_build
+  variables:
+    DOCKERFILE: Dockerfile.cpu
+    VERSION_SUFFIX: "-cpu"
+    BUILDX_CACHE: "$CI_REGISTRY_IMAGE/quan-asr-server-cache:buildx-cpu"
+
+
+
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  tags:
+    - docker-execuse-150
+  variables:
+    GIT_DEPTH: 0
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v-?.*-release$/'
+      when: on_success
+    - when: never
+  script:
+    - |
+      PREVIOUS_TAG=$(git describe --tags --abbrev=0 "$CI_COMMIT_TAG^" 2>/dev/null) || PREVIOUS_TAG=$(git rev-list --max-parents=0 HEAD)
+
+      echo "Previous reference point is $PREVIOUS_TAG"
+
+      CHANGES=$(git log --pretty=format:'- %s' "$PREVIOUS_TAG".."$CI_COMMIT_TAG")
+      echo "Changelog:"
+      echo "$CHANGES"
+
+      DESCR=$(cat <<EOF
+      ## Container images
+
+      - GPU: \`$IMAGE_NAME:$CI_COMMIT_TAG-gpu\` (also tagged \`latest-gpu\`)
+      - CPU: \`$IMAGE_NAME:$CI_COMMIT_TAG-cpu\` (also tagged \`latest-cpu\`)
+
+      ## Changelog
+
+      $CHANGES
+      EOF
+      )
+
+      release-cli create \
+        --name "$CI_COMMIT_TAG" \
+        --tag-name "$CI_COMMIT_TAG" \
+        --ref "$CI_COMMIT_SHA" \
+        --description "$DESCR"
+  environment:
+    name: production

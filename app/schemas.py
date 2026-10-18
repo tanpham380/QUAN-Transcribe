@@ -35,6 +35,7 @@ _KNOWN_FIELDS = frozenset(
         "response_format",
         "temperature",
         "stream",
+        "enable_streaming",
         "stream_partials",
         "timestamp_granularities",
         "timestamp_granularities[]",
@@ -206,7 +207,10 @@ def parse_transcription_form(form: Any) -> TranscriptionParams:
             "timestamp_granularities[]",
         )
 
-    streaming = _parse_bool(form.get("stream", "false"), "stream")
+    stream_val = form.get("stream")
+    if stream_val in (None, ""):
+        stream_val = form.get("enable_streaming", "false")
+    streaming = _parse_bool(stream_val, "stream")
 
     # ``stream_partials=false`` emits one event per finished utterance. It is an
     # extension: OpenAI's own API only ever streams deltas.

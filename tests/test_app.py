@@ -1308,13 +1308,21 @@ def test_streaming_sse(client):
     events = [
         json.loads(line[6:])
         for line in response.text.splitlines()
-        if line.startswith("data: ")
+        if line.startswith("data: ") and line.strip() != "data: [DONE]"
     ]
     kinds = [e["type"] for e in events]
     assert "transcript.text.delta" in kinds
     assert "transcript.text.segment" in kinds
     assert kinds[-1] == "transcript.text.done"
     assert events[-1]["text"] == "xin chào"
+    assert response.text.strip().endswith("data: [DONE]")
+
+    # Check compatibility with GPUStack / OpenAI streaming parsers
+    delta_events = [e for e in events if e["type"] == "transcript.text.delta"]
+    assert len(delta_events) > 0
+    assert "delta" in delta_events[0]
+    assert "choices" in delta_events[0]
+    assert delta_events[0]["choices"][0]["delta"]["content"] == delta_events[0]["text"]
 
 
 def test_streaming_drops_partials_when_asked(client):
@@ -1322,10 +1330,31 @@ def test_streaming_drops_partials_when_asked(client):
     kinds = [
         json.loads(line[6:])["type"]
         for line in response.text.splitlines()
-        if line.startswith("data: ")
+        if line.startswith("data: ") and line.strip() != "data: [DONE]"
     ]
     assert "transcript.text.delta" not in kinds
     assert "transcript.text.segment" in kinds
+
+
+def test_streaming_via_query_param_or_enable_streaming(client):
+    # Test query param ?stream=true (GPUStack / cURL URL format)
+    response = client.post(
+        "/v1/audio/transcriptions?stream=true",
+        files={"file": ("a.wav", wav_bytes(), "audio/wav")},
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.text.strip().endswith("data: [DONE]")
+
+    # Test enable_streaming flag
+    response2 = client.post(
+        "/v1/audio/transcriptions?enable_streaming=true",
+        files={"file": ("a.wav", wav_bytes(), "audio/wav")},
+    )
+    assert response2.status_code == 200
+    assert response2.headers["content-type"].startswith("text/event-stream")
+    assert response2.text.strip().endswith("data: [DONE]")
+
 
 def test_streaming_forwards_lm_options(client):
     from app import server
@@ -1333,6 +1362,7 @@ def test_streaming_forwards_lm_options(client):
     _upload(client, stream="true", use_lm="true", beam_width="8")
     assert server.engine.calls[-1]["use_lm"] is True
     assert server.engine.calls[-1]["beam_width"] == 8
+
 
 def test_non_streaming_forwards_lm_options(client):
     from app import server
@@ -1361,7 +1391,7 @@ def test_streaming_surfaces_engine_errors(monkeypatch):
     events = [
         json.loads(line[6:])
         for line in response.text.splitlines()
-        if line.startswith("data: ")
+        if line.startswith("data: ") and line.strip() != "data: [DONE]"
     ]
     assert events[0]["type"] == "error"
     assert "cuda out of memory" in events[0]["error"]["message"]

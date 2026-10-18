@@ -44,6 +44,8 @@ The repository has two parts that install together:
   - [Configuration](#configuration)
   - [Performance](#performance)
   - [Docker](#docker)
+  - [Deploying on GPUStack](#deploying-on-gpustack)
+  - [GitLab CI](#gitlab-ci)
   - [Development](#development)
 - [Credits](#credits)
 - [Licence](#licence)
@@ -271,7 +273,7 @@ makes it roughly **3,700× faster than realtime on a single H100** (upstream
 benchmark) and makes its output lowercase Vietnamese without punctuation, with
 numbers written as words.
 
-### What the server is
+#### What this repository is
 
 - A **serving layer**, not a training repo. It wraps the upstream
   [`quan_transcribe`](https://github.com/qnguyen3/QUAN-Transcribe) inference
@@ -783,7 +785,8 @@ syllable of a region (`quý khách` degrades to `cách`). The other knobs are
 
 It is off by default. Turn it on for call-centre or voicemail workloads; leave
 it off if your audio is already clean, clipped speech, where the extra pass buys
-nothing.
+nothing. The CPU profiles in `deploy/` and `docker/docker-compose.yaml` enable
+it, because CPU time is the scarce resource there.
 
 ```bash
 pip install ".[vad]"     # silero-vad + onnxruntime; the image already ships it
@@ -1026,6 +1029,109 @@ Two things the image deliberately does **not** do:
   policy forbids it, add a `USER` line and make `/cache/huggingface` writable.
 - **It declares no `VOLUME`**, so nothing is persisted unless you mount
   `/cache/huggingface` yourself (the compose profiles do).
+
+### Deploying on GPUStack
+
+1. Build and push the images to a registry the workers can reach (the CI builds
+   them — see [GitLab CI](#gitlab-ci)).
+2. Make sure the **workers can pull the private image**. `docker pull` runs on
+   the worker, so either log in once on each worker host
+   (`docker login registry.huongnghiepaau.com`) or start the worker with
+   `GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY_USERNAME` and
+   `GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY_PASSWORD` set to a
+   `read_registry` deploy token. Without credentials the deployment fails with
+   `unauthorized`.
+3. On the **Inference Backends** page choose **Add Backend → Custom** and paste
+   `deploy/gpustack-backend.yaml` (or apply
+   `deploy/gpustack-backend-source.yaml` as an `InferenceBackendSource`).
+   The `backend_name` must end in `-custom` — GPUStack enforces this.
+4. Point each version's `image_name` at the matching pushed image, then deploy
+   from that backend and pick the version that matches the worker.
+
+The two manifests hold the **same backend definition** and differ only in how
+GPUStack is meant to consume them:
+
+| File | Kind | Use it when |
+| --- | --- | --- |
+| `gpustack-backend.yaml` | a plain backend definition | you paste it into the UI or create the backend once by hand |
+| `gpustack-backend-source.yaml` | `InferenceBackendSource` | GPUStack is configured with a managed backend source (a FILE or URL source) and should materialise and keep the backend in sync itself |
+
+They are separate because a source document is authoritative for the versions
+it ships — GPUStack moves the framework list into `built_in_frameworks` and
+clears `custom_framework`, and a source cannot claim built-in status the way an
+imported backend does. Keeping both lets you start with the manual import and
+move to a managed source without rewriting the file.
+
+`image_name` must be **fully qualified** — registry host plus project path:
+
+```yaml
+image_name: registry.huongnghiepaau.com/dev/asr-engine/quan-asr-server:v1.0.0-release-gpu
+```
+
+GPUStack hands this string straight to `docker pull`, so a bare
+`quan-asr-server:…` would be resolved against Docker Hub and fail to pull. That
+path is exactly what `$CI_REGISTRY_IMAGE/quan-asr-server:<tag>-gpu` expands to
+in the pipeline, which is why the CI is the source of truth for the tag names.
+
+The manifest declares **two versions of the same backend**, which is how
+GPUStack expresses "CPU or GPU": scheduling is filtered by the version's
+framework, and `cpu` matches any worker while `cuda` matches only workers with
+an NVIDIA GPU.
+
+| Version | Image | `custom_framework` | Env set by the version | Schedulable on |
+| --- | --- | --- | --- | --- |
+| `1.0.0` | `…/quan-asr-server:v1.0.0-release-gpu` (`Dockerfile`) | `cuda` | none — inherits `default_env` | GPU workers |
+| `1.0.0-cpu` | `…/quan-asr-server:v1.0.0-release-cpu` (`Dockerfile.cpu`) | `cpu` | `DEVICE=cpu`, `MICROBATCH_SECONDS=0.25`, `MICROBATCH_MAX_WAIT_MS=10`, `MAX_QUEUE=256`, `SUBBATCH_SECONDS=30` | any worker, no GPU needed |
+
+Each version points at its own image — CUDA wheels for the GPU version, CPU
+wheels for the CPU version — so neither ships a runtime it does not use. The
+CUDA version sets no `env` of its own: `TF32` and the batch window come from the
+image defaults and the manifest's `default_env`. GPUStack applies a version's
+`env` on top of `default_env`, and version-level values win.
+
+The manifest also tells GPUStack to:
+
+- run the image's entrypoint with
+  `--model-path {{model_path}} --served-model-name {{model_name}} --host {{worker_ip}} --port {{port}}`,
+  which the server accepts as ordinary flags;
+- poll `health_check_path: /health` to decide when the model is ready.
+
+Because GPUStack downloads and mounts the model itself and passes the local
+directory through `{{model_path}}`, the server never re-downloads it. Custom
+backends are single-worker deployments.
+
+### GitLab CI
+
+`.gitlab-ci.yml` has two stages — `build-image` and `release` — and is gated on
+tags matching `v-<something>-release`:
+
+```bash
+git tag v1.0.0-release
+git push origin v1.0.0-release
+```
+
+- **`build_gpu`** builds `Dockerfile` with BuildKit (`--platform linux/amd64`,
+  cudnn runtime base, `INSTALL_LM=true` / `INSTALL_VAD=true` by default) and
+  pushes `$CI_REGISTRY_IMAGE/quan-asr-server:$CI_COMMIT_TAG-gpu` and `:latest-gpu`.
+- **`build_cpu`** builds `Dockerfile.cpu` the same way and pushes
+  `$CI_REGISTRY_IMAGE/quan-asr-server:$CI_COMMIT_TAG-cpu` and `:latest-cpu`.
+- **`release`** cuts a GitLab release whose description is the git log since the
+  previous tag, and lists both image tags.
+
+Both build jobs run in parallel and share a registry-backed layer cache (one
+cache tag each). There is no `test` stage: the suite is meant to be run locally
+(`pytest -q`, no GPU or model needed) — add a `test` job if you want it gated in
+CI.
+
+Point `image_name` at the pushed tags. The placeholder below expands to the
+fully qualified path GPUStack needs (see [Deploying on GPUStack](#deploying-on-gpustack)):
+
+```yaml
+"1.0.0":      image_name: registry.huongnghiepaau.com/dev/asr-engine/quan-asr-server:v1.0.0-release-gpu
+"1.0.0-cpu":  image_name: registry.huongnghiepaau.com/dev/asr-engine/quan-asr-server:v1.0.0-release-cpu
+```
+
+There is no deploy stage: GPUStack pulls the image itself when you deploy.
 
 ## Development
 
