@@ -1,0 +1,162 @@
+name: Docker
+
+# Builds and pushes the two GPUStack images to Docker Hub.
+#
+#   Dockerfile      -> <image>:<tag>-gpu  and  <image>:latest-gpu
+#   Dockerfile.cpu  -> <image>:<tag>-cpu  and  <image>:latest-cpu
+#
+# Triggered by a version tag (v1.0.0, v1.0.0-release, ...) or manually from the
+# Actions tab. There is no deploy stage: GPUStack pulls these images itself.
+#
+# Required environment secrets (environment name: DOCKERHUB_USERNAME):
+#   DOCKERHUB_USERNAME  Docker Hub account name
+#   DOCKERHUB_TOKEN     Docker Hub access token (not the account password)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag to publish (e.g. v1.0.1)'
+        required: true
+        type: string
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: docker.io
+  IMAGE: phamthanhtanlop92/quan-asr
+  CUDA: '12.6.1'
+  PYTHON_VERSION: '3.11'
+  TORCH_INDEX_GPU: https://download.pytorch.org/whl/cu126
+  TORCH_INDEX_CPU: https://download.pytorch.org/whl/cpu
+  # kenlm has no wheel and is compiled from source inside the image, which is
+  # the slowest step of the build. Set to false to skip it: the image then only
+  # does greedy decoding, so USE_LM must stay unset/false at runtime.
+  INSTALL_LM: 'true'
+  # silero-vad + onnxruntime, required by the CPU profiles that set USE_VAD.
+  INSTALL_VAD: 'true'
+  # vibert-capu punctuation + capitalization (CC-BY-SA-4.0 weights, baked in).
+  INSTALL_PUNCTUATOR: 'true'
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      # The suite is designed to run without torch, the model, or a GPU.
+      - name: Install
+        run: pip install -e ".[test]"
+
+      - name: Pytest
+        run: python -m pytest -q
+
+      - name: Ruff
+        run: ruff check app tests
+
+  build:
+    name: Build ${{ matrix.variant }}
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    environment: DOCKERHUB_USERNAME
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: gpu
+            dockerfile: Dockerfile
+            torch_index: https://download.pytorch.org/whl/cu126
+          - variant: cpu
+            dockerfile: Dockerfile.cpu
+            torch_index: https://download.pytorch.org/whl/cpu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Registry cache rather than the 10 GB GitHub Actions cache: a CUDA +
+      # torch image layer set does not fit, and thrashing it is slower than
+      # pulling the cache back from Docker Hub.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ steps.tag.outputs.value }}-${{ matrix.variant }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}:latest-${{ matrix.variant }}
+          build-args: |
+            CUDA=${{ env.CUDA }}
+            PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+            TORCH_INDEX=${{ matrix.torch_index }}
+            INSTALL_LM=${{ env.INSTALL_LM }}
+            INSTALL_VAD=${{ env.INSTALL_VAD }}
+            INSTALL_PUNCTUATOR=${{ env.INSTALL_PUNCTUATOR }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE }}-cache:buildx-${{ matrix.variant }}
+          cache-to: type=registry,mode=max,ref=${{ env.REGISTRY }}/${{ env.IMAGE }}-cache:buildx-${{ matrix.variant }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.tag.outputs.value }}
+
+  release:
+    name: Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            ## Container images
+
+            | Variant | Tag | Also tagged |
+            |---|---|---|
+            | GPU (CUDA ${{ env.CUDA }}, torch cu126) | `${{ env.IMAGE }}:${{ github.ref_name }}-gpu` | `latest-gpu` |
+            | CPU (torch cpu) | `${{ env.IMAGE }}:${{ github.ref_name }}-cpu` | `latest-cpu` |
+
+            ## GPUStack
+
+            - Image (GPU): `${{ env.IMAGE }}:latest-gpu`
+            - Image (CPU): `${{ env.IMAGE }}:latest-cpu`
+            - Port: `8000`, health probe: `/ready`
