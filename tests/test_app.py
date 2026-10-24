@@ -136,7 +136,10 @@ def test_to_16k_mono_downmixes_and_resamples():
     assert mono.ndim == 1
     # 1 s at 32 kHz becomes 1 s at 16 kHz.
     assert abs(len(mono) - SAMPLE_RATE) <= 2
-    assert np.allclose(mono, 0.5, atol=1e-4)
+    # soxr is band-limited, so it rings where the signal steps 0 -> 0.5 -> 0.
+    # Only the interior is flat; the edges are expected to overshoot.
+    assert np.allclose(mono[100:-100], 0.5, atol=1e-4)
+    assert np.allclose(mono, 0.5, atol=0.2)
 
 
 def test_to_16k_mono_accepts_channels_first():
