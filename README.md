@@ -24,6 +24,7 @@ The repository has two parts that install together:
 - [Install](#install)
   - [From source (development)](#from-source-development)
   - [Model access](#model-access)
+  - [Supported checkpoints](#supported-checkpoints)
 - [Quickstart](#quickstart)
 - [Usage](#usage)
   - [Streaming mode](#streaming-mode)
@@ -72,10 +73,51 @@ uv sync
 uv run quan-transcribe --mic
 ```
 
+The server reads its settings from the environment and does not parse `.env` itself, so pass the file to `uv`:
+
+```bash
+cp .env.example .env      # then edit it
+uv run --env-file .env quan-asr-server
+```
+
+`uv run` alone does **not** read `.env` (only `docker run --env-file .env` and compose do).
+
 ### Model access
 
 The base encoder `google/embeddinggemma-2` is downloaded on first use. It is gated: accept its terms on the model page
 and log in with `hf auth login` (or set `HF_TOKEN`).
+
+### Supported checkpoints
+
+`--model` / `from_pretrained` accepts any repo (or local directory) laid out in either of the two formats the
+QUAN-Transcribe architecture has been released in:
+
+| layout | files in the repo | example |
+|---|---|---|
+| safetensors | `config.json` + `units.json` + `model.safetensors` | [`qnguyen3/QUAN-Transcribe-1.0`](https://huggingface.co/qnguyen3/QUAN-Transcribe-1.0) |
+| torch | one `*.pt` holding `model`, `model_config`, `gemma_ids` | [`5CD-AI/VieGem-ASR`](https://huggingface.co/5CD-AI/VieGem-ASR) |
+
+The format is detected from the files present, so no flag is needed:
+
+```bash
+quan-transcribe --model 5CD-AI/VieGem-ASR audio.wav
+quan-transcribe --model 5CD-AI/VieGem-ASR --lm audio.wav      # its own lm/viegem_lm.bin
+```
+
+```python
+asr = QuanTranscribe.from_pretrained("5CD-AI/VieGem-ASR")
+asr = QuanTranscribe.from_pretrained("5CD-AI/VieGem-ASR", lm=True)
+```
+
+The two checkpoints differ only in what the loader reads, not in the code path: `head_cosine` in `model_config` /
+`config.json` selects a cosine-similarity output head (with a learned `logit_scale`) instead of a dot product, and the
+number of unit rows follows `vocab_size`. Everything else — encoder, reader, greedy CTC, streaming masks and the
+KenLM beam search — is shared. Each family keeps the beam-search weights it was tuned with (α 0.3 / β 1.0 for
+QUAN-Transcribe-1.0, α 0.35 / β 1.5 for VieGem-ASR); `lm_config.json` overrides them when present.
+
+A checkpoint that uses an architecture feature this package does not implement (for example a LoRA-adapted encoder)
+fails with a `checkpoint does not match the model` message naming the unexpected keys rather than silently producing
+garbage.
 
 ## Quickstart
 
@@ -171,6 +213,9 @@ asr.transcribe("audio.wav", use_lm=False)    # greedy
 ```
 
 - **Tuning:** `beam_width` / `--beam-width` (default 32), `--lm-alpha` (LM weight), `--lm-beta` (word bonus).
+- **Model families:** the bundled LM is found by pattern, so both `vi_4gram.bin` + `unigrams.txt` +
+  `lm_config.json` (QUAN-Transcribe-1.0) and `viegem_lm.bin` + `viegem_lm.unigrams.txt` (VieGem-ASR) load the same
+  way. Without `lm_config.json` the weights each family was tuned with are used (α 0.3 / β 1.0, or α 0.35 / β 1.5).
 - **Your own LM:** `lm="path/to/model.bin"` or `--lm-path`. It must be a word-level KenLM model over text that is
   lowercase, without punctuation, and with numbers written as words.
 - **Cost:** beam search runs on the CPU, one utterance at a time. It takes a few tens of milliseconds per utterance,
@@ -249,6 +294,7 @@ See the [model card](https://huggingface.co/qnguyen3/QUAN-Transcribe-1.0) for th
 | CUDA out of memory | lower `--batch-seconds` (e.g. `60`); long files are batched together by length |
 | `no LM loaded` from `transcribe(use_lm=True)` | pass `lm=True` to `from_pretrained` or call `load_lm(path)` first |
 | `ModuleNotFoundError: kenlm` with `--lm` | `pip install "quan-transcribe[lm]"` (KenLM builds from source, needs a C++ compiler) |
+| `checkpoint does not match the model` with a new repo | the checkpoint uses an architecture feature this package does not implement; the message lists the unexpected keys (e.g. LoRA parameters on the encoder) |
 | no microphone / `--list-devices` prints nothing | install a PortAudio backend (macOS: `brew install portaudio`, Linux: `apt install libportaudio2`) and reinstall `sounddevice` |
 | mp3/flac fails to load | `soundfile` needs libsndfile >= 1.1; upgrade it (`pip install -U soundfile`) |
 | empty output on speech | the model expects 16 kHz mono; pass the correct `sample_rate` for raw waveforms |
@@ -1207,6 +1253,43 @@ bulk pieces are coalesced into one padded forward pass, and a bounded queue
 sheds load with a `503` rather than growing latency. Loading happens behind its
 own lock so concurrent first requests cannot race, and a load failure does not
 kill the container — it surfaces through `/health` as `"error"`.
+
+### Agent customization
+
+[`AGENTS.md`](AGENTS.md) is the shared project guide for coding agents. It is
+read natively by VS Code Copilot, Google Antigravity, Codex and any other
+`AGENTS.md`-aware tool, so the invariants and conventions live in one place.
+
+[`.agents/`](.agents) holds the deeper material, in the formats Antigravity
+discovers automatically and VS Code reads as Agent Skills:
+
+```
+AGENTS.md                          shared project guide (all agents)
+.agents/rules/*.md                 scoped rules, YAML frontmatter `trigger:`
+.agents/skills/<name>/SKILL.md     task playbooks, loaded on demand
+```
+
+Rules use Antigravity's activation modes: `always_on` for the working
+agreements, `glob` for file-scoped rules (`*.py`, `app/audio.py`, ...), and
+`model_decision` for the engine-architecture rule, which is injected as a
+description and read in full only when a task matches.
+
+| Rule | Trigger | Covers |
+|---|---|---|
+| `working-agreements.md` | `always_on` | The five invariants, validation commands, never-do list |
+| `engine-architecture.md` | `model_decision` | The one-model-thread design, priority classes, backpressure |
+| `python-style.md` | `glob: *.py` | Typing, docstrings, error types, config, optional deps |
+| `audio-pipeline.md` | `glob: app/audio.py, app/vad.py, ...` | Cut points, VAD, the torch thread-count trap |
+| `text-and-api.md` | `glob: app/postprocess.py, ...` | Post-processing order, response formats, request parsing |
+| `inference-library.md` | `glob: quan_transcribe/**/*.py` | Checkpoint layouts, CTC decoding, feature extractor |
+
+| Skill | Use when |
+|---|---|
+| `engine-scheduling` | A request is slow, a `503` appears, live audio stutters |
+| `engine-review` | Reviewing a diff to `app/core.py`, `app/engine.py`, `app/vad.py` |
+| `transcript-tuning` | Output text is unpunctuated, lowercase, or has numbers as words |
+| `diagnose-latency` | Tracing a saturation or throughput problem |
+| `validate` | Running the test/lint/format gate |
 
 ## Credits
 
