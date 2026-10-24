@@ -80,7 +80,9 @@ class Settings:
     #: model repo's ``lm/`` folder. Overrides ``use_lm`` when set.
     lm_path: str | None = None
     #: LM weight and word-insertion bonus. ``None`` (the default) keeps the
-    #: values from the LM's own ``lm_config.json``, which ship at 0.3 / 1.0.
+    #: values from the LM's own ``lm_config.json``, else the ones the
+    #: checkpoint family was tuned with (0.3 / 1.0 for QUAN-Transcribe-1.0,
+    #: 0.35 / 1.5 for VieGem-ASR).
     lm_alpha: float | None = None
     lm_beta: float | None = None
     #: Beams kept by the beam search. Ignored when no LM is loaded.
@@ -163,11 +165,28 @@ class Settings:
     api_key: str | None = None
     cors_origins: tuple[str, ...] = ("*",)
     max_upload_mb: int = 200
+    #: How many uploads may be decoded and waiting for the model at once. Each
+    #: one holds its waveform in RAM (``MAX_UPLOAD_MB`` at worst), so this is the
+    #: admission control that keeps a burst from exhausting memory before the
+    #: decode queue ever sees the work. ``0`` disables the cap.
+    max_inflight_requests: int = 8
     log_level: str = "info"
 
-    # --- enterprise postprocessing & multi-worker ----------------------------
+    # --- enterprise postprocessing -------------------------------------------
     enable_punctuation: bool = False
-    devices: tuple[str, ...] = ("auto",)
+    #: Restore punctuation and capitalization with the vibert-capu ViBERT model
+    #: instead of the regexes in ``app/postprocess.py``. The regexes can only
+    #: append ``.`` or ``?`` at the end of a segment, so a comma or a colon is
+    #: unreachable; the model predicts ``. , : ?`` and complex casing per word.
+    #: Requires the ``punctuate`` extra. See ``app/punctuate.py``.
+    use_punctuator: bool = False
+    #: Hugging Face repo id or local directory holding the ONNX export.
+    punctuator_model: str = "welcomyou/vibert-capu-onnx"
+    #: Prefer the int8 build: 110 MB against 438 MB, ~99% of the accuracy.
+    punctuator_int8: bool = True
+    #: Words per forward pass. The graph accepts up to 512 tokens; longer text
+    #: is cut into windows of this many words and the pieces are rejoined.
+    punctuator_max_words: int = 200
 
     @property
     def supports_lm(self) -> bool:
@@ -268,12 +287,14 @@ class Settings:
             api_key=_get("API_KEY"),
             cors_origins=tuple(o.strip() for o in origins.split(",") if o.strip()),
             max_upload_mb=_maybe_int("MAX_UPLOAD_MB", 200) or 200,
+            max_inflight_requests=_maybe_int("MAX_INFLIGHT_REQUESTS", 8) or 0,
             log_level=(_get("LOG_LEVEL", "info") or "info").lower(),
             enable_punctuation=_flag("PUNCTUATE", False),
-            devices=(
-                tuple(d.strip() for d in _get("DEVICES", "").split(",") if d.strip())
-                or (_maybe_str("DEVICE") or "auto",)
-            ),
+            use_punctuator=_flag("USE_PUNCTUATOR", False),
+            punctuator_model=_get("PUNCTUATOR_MODEL", "welcomyou/vibert-capu-onnx")
+            or "welcomyou/vibert-capu-onnx",
+            punctuator_int8=_flag("PUNCTUATOR_INT8", True),
+            punctuator_max_words=_maybe_int("PUNCTUATOR_MAX_WORDS", 200) or 200,
         )
 
     def merge(self, **overrides: Any) -> Settings:

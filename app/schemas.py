@@ -16,6 +16,12 @@ from .config import SUPPORTED_LANGUAGES
 RESPONSE_FORMATS = ("json", "text", "srt", "verbose_json", "vtt")
 TIMESTAMP_GRANULARITIES = ("word", "segment")
 
+#: Granularities OpenAI documents. Only ``segment`` can be produced by this CTC
+#: model; ``word`` is still recognised so it can be rejected with an explicit
+#: message instead of silently returning ``[]``.
+TIMESTAMP_GRANULARITIES = ("word", "segment")
+SUPPORTED_GRANULARITIES = ("segment",)
+
 #: Server-side bounds so a stray field cannot make the model do unbounded work.
 MIN_CHUNK_SECONDS = 1.0
 MAX_CHUNK_SECONDS = 300.0
@@ -64,6 +70,7 @@ class APIError(Exception):
         code: str | None = None,
         param: str | None = None,
         error_type: str = "invalid_request_error",
+        headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -71,6 +78,8 @@ class APIError(Exception):
         self.code = code
         self.param = param
         self.error_type = error_type
+        #: Extra response headers, e.g. ``Retry-After`` on a retryable ``503``.
+        self.headers = headers or {}
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -99,7 +108,7 @@ class TranscriptionParams:
     use_lm: bool | None = None
     beam_width: int | None = None
     chunk_seconds: float | None = None
-    punctuate: bool = False
+    punctuate: bool | None = None
     phonemes: bool = False
     norm_mode: str = "itn"
 
@@ -192,10 +201,21 @@ def parse_transcription_form(form: Any) -> TranscriptionParams:
         normalized = str(value).strip().lower()
         if not normalized:
             continue
-        if normalized not in TIMESTAMP_GRANULARITIES:
+        if normalized == "word":
+            # A single CTC pass aligns at frame level, not at word level, so the
+            # server has no word boundaries to report. Reject it instead of
+            # accepting the request and returning ``"words": []``, which looks
+            # like a successful answer with no words in it.
+            raise _bad(
+                "word-level timestamps are not available: this model is a "
+                "single-pass CTC decoder with segment-level alignment only; "
+                "request 'segment' (or omit timestamp_granularities)",
+                "timestamp_granularities[]",
+            )
+        if normalized not in SUPPORTED_GRANULARITIES:
             raise _bad(
                 "timestamp_granularities must be a subset of "
-                f"{', '.join(TIMESTAMP_GRANULARITIES)}",
+                f"{SUPPORTED_GRANULARITIES}",
                 "timestamp_granularities[]",
             )
         if normalized not in granularities:
@@ -216,9 +236,7 @@ def parse_transcription_form(form: Any) -> TranscriptionParams:
     # extension: OpenAI's own API only ever streams deltas.
     streaming_partials = True
     if form.get("stream_partials") not in (None, ""):
-        streaming_partials = _parse_bool(
-            form.get("stream_partials"), "stream_partials"
-        )
+        streaming_partials = _parse_bool(form.get("stream_partials"), "stream_partials")
 
     left_chunks = None
     if form.get("left_chunks") not in (None, ""):
@@ -248,7 +266,10 @@ def parse_transcription_form(form: Any) -> TranscriptionParams:
                 "chunk_seconds",
             )
 
-    punctuate = False
+    # Tri-state: ``None`` means "whatever the deployment configured", so an
+    # explicit ``punctuate=true`` can turn punctuation on for one request even
+    # when the server default is off. A bare ``False`` could not express that.
+    punctuate: bool | None = None
     raw_punc = (
         form.get("punctuate")
         if form.get("punctuate") is not None
@@ -261,7 +282,11 @@ def parse_transcription_form(form: Any) -> TranscriptionParams:
     raw_phonemes = (
         form.get("phonemes")
         if form.get("phonemes") is not None
-        else (form.get("include_phonemes") if form.get("include_phonemes") is not None else form.get("g2p"))
+        else (
+            form.get("include_phonemes")
+            if form.get("include_phonemes") is not None
+            else form.get("g2p")
+        )
     )
     if raw_phonemes not in (None, ""):
         phonemes = _parse_bool(raw_phonemes, "phonemes")

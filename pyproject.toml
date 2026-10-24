@@ -29,7 +29,10 @@ dependencies = [
 lm = ["kenlm"]  # n-gram LM beam search; built from source, needs a C++ compiler
 grpc = ["grpcio>=1.60.0", "protobuf>=4.25.0"]
 vad = ["silero-vad>=6.0", "onnxruntime>=1.16"]
-test = ["pytest>=8", "httpx>=0.27", "pytest-asyncio>=0.23"]
+# vibert-capu punctuation + capitalization. The weights are CC-BY-SA-4.0, not
+# Apache-2.0 like the rest of this repository; see app/punctuate.py.
+punctuate = ["onnxruntime>=1.16", "transformers>=4.30"]
+test = ["pytest>=8", "httpx>=0.27", "pytest-asyncio>=0.23", "ruff>=0.6"]
 
 [project.urls]
 Model = "https://huggingface.co/qnguyen3/QUAN-Transcribe-1.0"
@@ -41,7 +44,6 @@ quan-asr = "app.cli:main"
 
 [tool.setuptools]
 packages = ["quan_transcribe", "app", "app.proto"]
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]

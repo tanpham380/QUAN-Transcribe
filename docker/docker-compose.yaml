@@ -32,6 +32,11 @@ x-common: &common
     # Silero VAD: skip decoding silence and cut pieces on real pauses. Off by
     # default; the CPU profile below turns it on. Requires the 'vad' extra.
     USE_VAD: ${USE_VAD:-false}
+    # vibert-capu punctuation + capitalization. The image bakes the weights into
+    # /opt/models/vibert-capu, so this needs no network at runtime. Requires the
+    # 'punctuate' extra (the image ships it).
+    USE_PUNCTUATOR: ${USE_PUNCTUATOR:-false}
+    PUNCTUATOR_MODEL: ${PUNCTUATOR_MODEL:-/opt/models/vibert-capu}
     # Uncomment to require a bearer token, like OpenAI's own API.
     # API_KEY: ${API_KEY:-}
   restart: unless-stopped

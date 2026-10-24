@@ -14,7 +14,9 @@ __pycache__
 .ruff_cache
 .mypy_cache
 
-# Local model caches must never be baked into an image.
+# Local model caches must never be baked into an image. The one exception is
+# the vendored punctuator: the Dockerfiles fetch it into /opt/models at build
+# time so the image needs no network at runtime.
 cache
 models
 *.safetensors
@@ -36,6 +38,9 @@ tests/audio
 docker
 deploy
 scripts
+# The punctuator fetch script is the one thing under scripts/ the image needs:
+# the Dockerfiles run it to bake the weights into /opt/models.
+!scripts/fetch_punctuator.py
 tests
 # NOTE: README.md must stay in the context: the Dockerfile copies it because
 # pyproject.toml declares `readme = "README.md"`, and setuptools reads it when

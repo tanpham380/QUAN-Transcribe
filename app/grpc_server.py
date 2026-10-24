@@ -50,7 +50,9 @@ class SpeechServicer(speech_pb2_grpc.SpeechServicer):
             wav, sr = decode_audio_bytes(request.audio_content)
             wav = to_16k_mono(wav, sr)
         except AudioDecodeError as exc:
-            context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"cannot decode audio: {exc}")
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT, f"cannot decode audio: {exc}"
+            )
 
         enable_punc = True
         enable_phonemes = False
@@ -121,7 +123,7 @@ class SpeechServicer(speech_pb2_grpc.SpeechServicer):
 
                     left_chunks = config.left_chunks if config.left_chunks > 0 else None
                     use_lm = config.use_lm or None
-                    live = self.engine.create_live_session(
+                    live = self.engine.new_live_session(
                         left_chunks=left_chunks,
                         use_lm=use_lm,
                     )
@@ -129,7 +131,7 @@ class SpeechServicer(speech_pb2_grpc.SpeechServicer):
 
                 # Lazily initialize if no config message was sent
                 if live is None:
-                    live = self.engine.create_live_session()
+                    live = self.engine.new_live_session()
 
                 # 2. Audio chunks
                 chunk = req.audio_content
@@ -141,7 +143,9 @@ class SpeechServicer(speech_pb2_grpc.SpeechServicer):
                     samples /= 32768.0
                 else:
                     usable = len(chunk) - (len(chunk) % 4)
-                    samples = np.frombuffer(chunk[:usable], dtype="<f4").astype(np.float32)
+                    samples = np.frombuffer(chunk[:usable], dtype="<f4").astype(
+                        np.float32
+                    )
 
                 events = live.accept(samples)
                 for ev in events:
@@ -162,7 +166,7 @@ class SpeechServicer(speech_pb2_grpc.SpeechServicer):
                                     ],
                                     is_final=False,
                                     stability=0.7,
-                                    result_end_time=round(ev.start + ev.duration, 2),
+                                    result_end_time=round(ev.end, 2),
                                 )
                             ]
                         )
@@ -183,33 +187,37 @@ class SpeechServicer(speech_pb2_grpc.SpeechServicer):
                                     ],
                                     is_final=True,
                                     stability=1.0,
-                                    result_end_time=round(ev.start + ev.duration, 2),
+                                    result_end_time=round(ev.end, 2),
                                 )
                             ]
                         )
 
-            # Stream finished by client
+            # Stream finished by client: ``flush`` returns the last transcript text.
             if live is not None:
-                for ev in live.flush():
-                    if ev.text:
-                        text = default_post_processor.process(ev.text, is_final=True) if enable_punc else ev.text
-                        ph = to_phonemes(text) if enable_phonemes and text else ""
-                        yield speech_pb2.StreamingRecognizeResponse(
-                            results=[
-                                speech_pb2.StreamingRecognitionResult(
-                                    alternatives=[
-                                        speech_pb2.SpeechRecognitionAlternative(
-                                            transcript=text,
-                                            confidence=0.98,
-                                            phonemes=ph,
-                                        )
-                                    ],
-                                    is_final=True,
-                                    stability=1.0,
-                                    result_end_time=round(ev.start + ev.duration, 2),
-                                )
-                            ]
-                        )
+                tail = live.flush()
+                if tail:
+                    text = (
+                        default_post_processor.process(tail, is_final=True)
+                        if enable_punc
+                        else tail
+                    )
+                    ph = to_phonemes(text) if enable_phonemes and text else ""
+                    yield speech_pb2.StreamingRecognizeResponse(
+                        results=[
+                            speech_pb2.StreamingRecognitionResult(
+                                alternatives=[
+                                    speech_pb2.SpeechRecognitionAlternative(
+                                        transcript=text,
+                                        confidence=0.98,
+                                        phonemes=ph,
+                                    )
+                                ],
+                                is_final=True,
+                                stability=1.0,
+                                result_end_time=round(live.consumed_seconds, 2),
+                            )
+                        ]
+                    )
 
         except Exception as exc:
             logger.exception("gRPC StreamingRecognize error")

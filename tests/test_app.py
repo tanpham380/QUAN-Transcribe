@@ -27,6 +27,7 @@ from app.schemas import APIError, parse_transcription_form
 # config
 # --------------------------------------------------------------------------- #
 
+
 def _collect_errors(errors, call, *args):
     """Wrap a callable for a test thread, recording rather than raising.
 
@@ -128,7 +129,9 @@ def test_blank_env_falls_back_to_default(monkeypatch):
 
 
 def test_to_16k_mono_downmixes_and_resamples():
-    stereo = np.stack([np.ones(32_000, dtype=np.float32), np.zeros(32_000, dtype=np.float32)], axis=1)
+    stereo = np.stack(
+        [np.ones(32_000, dtype=np.float32), np.zeros(32_000, dtype=np.float32)], axis=1
+    )
     mono = to_16k_mono(stereo, 32_000)
     assert mono.ndim == 1
     # 1 s at 32 kHz becomes 1 s at 16 kHz.
@@ -169,6 +172,7 @@ def test_split_with_offsets_drops_very_short_tail():
     pieces = split_with_offsets(wav, chunk_s=10.0)
     assert pieces == []
 
+
 def test_split_with_offsets_in_regions_never_spans_a_gap():
     wav = np.random.default_rng(0).normal(0, 0.1, 10 * SAMPLE_RATE).astype(np.float32)
     regions = [(0, 2 * SAMPLE_RATE), (5 * SAMPLE_RATE, 6 * SAMPLE_RATE)]
@@ -178,6 +182,7 @@ def test_split_with_offsets_in_regions_never_spans_a_gap():
         assert any(lo <= start and end <= hi for lo, hi in regions)
     # ...and the 2 s..5 s gap is never decoded.
     assert sum(end - start for _, start, end in pieces) == 3 * SAMPLE_RATE
+
 
 def test_split_with_offsets_in_regions_splits_each_region_independently():
     wav = np.random.default_rng(1).normal(0, 0.1, 6 * SAMPLE_RATE).astype(np.float32)
@@ -475,9 +480,11 @@ def test_engine_reports_lm_details():
     assert info["lm_alpha"] == 0.3
     assert info["lm_beta"] == 1.0
 
+
 # --------------------------------------------------------------------------- #
 # voice activity detection
 # --------------------------------------------------------------------------- #
+
 
 class _StubVad:
     """A VAD whose speech regions are scripted, so no torch is needed."""
@@ -500,6 +507,7 @@ class _StubVad:
     def stats(self):
         return {"enabled": True, "loaded": True, "backend": "stub"}
 
+
 def test_vad_settings_from_env(monkeypatch):
     monkeypatch.setenv("USE_VAD", "true")
     monkeypatch.setenv("VAD_SPEECH_PAD_MS", "100")
@@ -516,10 +524,12 @@ def test_vad_settings_from_env(monkeypatch):
     assert config.min_silence_ms == 500
     assert config.trim_silence is False
 
+
 def test_vad_zero_padding_is_preserved(monkeypatch):
     # 0 is a meaningful value: no padding at all.
     monkeypatch.setenv("VAD_SPEECH_PAD_MS", "0")
     assert Settings.from_env().vad_speech_pad_ms == 0
+
 
 def test_vad_keeps_silence_tiles_the_whole_waveform():
     from app.vad import VadConfig, VoiceActivityDetector
@@ -530,6 +540,7 @@ def test_vad_keeps_silence_tiles_the_whole_waveform():
     # Every sample belongs to exactly one region, gaps included.
     assert regions == [(0, 100), (100, 200), (200, 400), (400, 500), (500, 600)]
 
+
 def test_vad_trim_returns_only_speech():
     from app.vad import VadConfig, VoiceActivityDetector
 
@@ -537,6 +548,7 @@ def test_vad_trim_returns_only_speech():
     detector.speech_regions = lambda wav: [(100, 200), (400, 500)]
     regions = detector.regions(np.zeros(600, dtype=np.float32), keep_silence=False)
     assert regions == [(100, 200), (400, 500)]
+
 
 def test_engine_uses_vad_regions_when_enabled():
     engine = _engine(use_vad=True)
@@ -547,6 +559,7 @@ def test_engine_uses_vad_regions_when_enabled():
     # Trim is on by default, so silence ranges are requested, not full tiling.
     assert stub.keep_silence_calls == [False]
 
+
 def test_engine_asks_vad_to_keep_silence_when_trimming_is_off():
     engine = _engine(use_vad=True, vad_trim_silence=False)
     engine._asr = _StubAsr()
@@ -555,6 +568,7 @@ def test_engine_asks_vad_to_keep_silence_when_trimming_is_off():
     engine.transcribe(np.zeros(4 * SAMPLE_RATE, dtype=np.float32))
     assert stub.keep_silence_calls == [True]
 
+
 def test_engine_ignores_vad_when_disabled():
     engine = _engine(use_vad=False)
     engine._asr = _StubAsr()
@@ -562,6 +576,7 @@ def test_engine_ignores_vad_when_disabled():
     engine._vad = stub
     engine.transcribe(np.zeros(2 * SAMPLE_RATE, dtype=np.float32))
     assert stub.keep_silence_calls == []
+
 
 def test_engine_falls_back_when_vad_fails():
     engine = _engine(use_vad=True)
@@ -572,6 +587,7 @@ def test_engine_falls_back_when_vad_fails():
     assert len(segments) == 1
     assert segments[0].end == pytest.approx(2.0)
 
+
 def test_engine_reports_vad_in_info_and_metrics():
     engine = _engine(use_vad=True)
     engine._asr = _StubAsr()
@@ -579,14 +595,17 @@ def test_engine_reports_vad_in_info_and_metrics():
     assert engine.info()["vad"]["enabled"] is True
     assert engine.metrics()["vad"]["backend"] == "stub"
 
+
 def test_vad_is_absent_from_metrics_when_unused():
     engine = _engine(use_vad=False)
     engine._asr = _StubAsr()
     assert engine.metrics()["vad"] is None
 
+
 # --------------------------------------------------------------------------- #
 # hardware profile and micro-batching
 # --------------------------------------------------------------------------- #
+
 
 @pytest.mark.parametrize(
     ("device", "profile"),
@@ -603,6 +622,7 @@ def test_vad_is_absent_from_metrics_when_unused():
 def test_profile_derives_from_device(device, profile):
     assert _engine(device=device).settings.profile == profile
 
+
 def test_microbatch_defaults_are_on():
     settings = Settings.from_env()
     assert settings.microbatch_seconds == 0.15
@@ -613,14 +633,17 @@ def test_microbatch_defaults_are_on():
     assert settings.tf32 is True
     assert settings.cpu_threads is None
 
+
 def test_microbatch_can_be_disabled_from_env(monkeypatch):
     monkeypatch.setenv("MICROBATCH_SECONDS", "0")
     assert Settings.from_env().microbatch_seconds == 0.0
+
 
 def test_zero_wait_is_preserved(monkeypatch):
     """0 is a meaningful wait: batch only what is already queued."""
     monkeypatch.setenv("MICROBATCH_MAX_WAIT_MS", "0")
     assert Settings.from_env().microbatch_max_wait_ms == 0.0
+
 
 def test_queue_caps_from_env(monkeypatch):
     monkeypatch.setenv("MAX_QUEUE", "0")
@@ -630,9 +653,11 @@ def test_queue_caps_from_env(monkeypatch):
     assert settings.max_queue == 0
     assert settings.max_interactive == 4
 
+
 # --------------------------------------------------------------------------- #
 # engine core (the scheduler that owns the model)
 # --------------------------------------------------------------------------- #
+
 
 def _start_core(engine, **overrides):
     """Attach a scripted model to the engine and bring its core up.
@@ -646,6 +671,7 @@ def _start_core(engine, **overrides):
     engine._asr = _StubAsr()
     engine._start_core()
     return engine._core
+
 
 def test_core_coalesces_concurrent_requests():
     """Two overlapping requests should share one forward pass, not two."""
@@ -673,6 +699,7 @@ def test_core_coalesces_concurrent_requests():
     finally:
         engine.close()
 
+
 def test_core_packs_by_padded_cost():
     """A long piece must not drag an unrelated short one into its batch."""
     from app.core import EngineCore
@@ -695,6 +722,7 @@ def test_core_packs_by_padded_cost():
     finally:
         core.stop()
     assert [len(group) for group in seen] == [1, 1]
+
 
 def test_core_keeps_different_signatures_apart():
     from app.core import EngineCore
@@ -720,6 +748,7 @@ def test_core_keeps_different_signatures_apart():
     # One signature, one launch, the context passed through verbatim.
     assert calls == [("greedy", 2)]
 
+
 def test_core_propagates_model_errors():
     from app.core import EngineCore
 
@@ -736,6 +765,7 @@ def test_core_propagates_model_errors():
     finally:
         core.stop()
 
+
 def test_core_sheds_when_the_queue_is_full():
     """Backpressure: a full queue refuses work instead of growing latency."""
     import threading
@@ -745,6 +775,7 @@ def test_core_sheds_when_the_queue_is_full():
 
     release = threading.Event()
     entered = threading.Event()
+
     def slow(wavs, _ctx):
         entered.set()
         release.wait(timeout=5)
@@ -793,6 +824,7 @@ def test_core_sheds_when_the_queue_is_full():
         core.stop()
     # A shutdown that shed the queued piece is expected, not a failure.
     assert not [e for e in errors if not isinstance(e, EngineBusy)]
+
 
 def test_core_preempts_bulk_with_interactive_work():
     """An interactive job jumps ahead of a queued sub-batch."""
@@ -858,6 +890,7 @@ def test_core_preempts_bulk_with_interactive_work():
     # Sub-batch 1 runs, the interactive job preempts sub-batch 2, then it runs.
     assert order == ["bulk", "interactive", "bulk"]
 
+
 def test_core_dispatches_interactive_without_waiting_for_the_window():
     """The coalescing window must never delay an interactive job."""
     import time as _time
@@ -878,6 +911,7 @@ def test_core_dispatches_interactive_without_waiting_for_the_window():
         assert (_time.monotonic() - started) < 0.25
     finally:
         core.stop()
+
 
 def test_subbatch_cap_splits_one_large_request():
     """A single big request must become several launches, not one.
@@ -907,6 +941,7 @@ def test_subbatch_cap_splits_one_large_request():
         core.stop()
     # 5 pieces, 2 per pass -> 3 launches instead of 1.
     assert seen == [2, 2, 1]
+
 
 def test_subbatch_cap_lets_a_live_job_interrupt_a_long_file():
     """The regression: a long file must not block a live step end to end."""
@@ -969,6 +1004,7 @@ def test_subbatch_cap_lets_a_live_job_interrupt_a_long_file():
     assert order[1] == "interactive"
     assert order.count("bulk") == 4
 
+
 def test_engine_starts_a_core_when_loaded():
     """Loading the model always creates the model thread, batching or not."""
     engine = _engine()
@@ -980,6 +1016,7 @@ def test_engine_starts_a_core_when_loaded():
         assert engine._core.started
     finally:
         engine.close()
+
 
 def test_transcribe_runs_through_the_core_without_a_lock():
     engine = _engine()
@@ -1024,6 +1061,18 @@ class FakeEngine:
         return self
 
     def warmup(self):
+        return None
+
+    @property
+    def punctuator(self):
+        """``None`` unless a test opts in; mirrors the real engine's gate."""
+        return getattr(self, "_punctuator", None)
+
+    @punctuator.setter
+    def punctuator(self, value):
+        self._punctuator = value
+
+    def load_punctuator(self):
         return None
 
     def close(self):
@@ -1277,6 +1326,7 @@ def test_missing_file_is_an_openai_error(client):
     assert response.status_code == 400
     assert "error" in response.json()
 
+
 def test_busy_engine_returns_503(client):
     """Backpressure surfaces as a retryable 503, not a hang."""
     from app import server
@@ -1429,18 +1479,14 @@ def test_websocket_pings_and_rejects_unknown(client):
 
 
 def test_websocket_rejects_bad_format(client):
-    with client.websocket_connect(
-        "/v1/audio/transcriptions/stream?format=mp3"
-    ) as ws:
+    with client.websocket_connect("/v1/audio/transcriptions/stream?format=mp3") as ws:
         error = ws.receive_json()
         assert error["type"] == "error"
         assert "format" in error["error"]["message"]
 
 
 def test_websocket_pcm16(client):
-    with client.websocket_connect(
-        "/v1/audio/transcriptions/stream?format=pcm16"
-    ) as ws:
+    with client.websocket_connect("/v1/audio/transcriptions/stream?format=pcm16") as ws:
         assert ws.receive_json()["format"] == "pcm16"
         ws.send_bytes(np.zeros(int(0.6 * SAMPLE_RATE), dtype="<i2").tobytes())
         assert ws.receive_json()["type"] in {
@@ -1461,6 +1507,7 @@ def test_websocket_handles_short_trailing_byte(client):
         first = ws.receive_json()
         assert first["type"] in {"transcript.text.delta", "transcript.text.done"}
 
+
 def test_websocket_forwards_lm_options(client):
     from app import server
 
@@ -1476,13 +1523,13 @@ def test_websocket_forwards_lm_options(client):
     assert call["use_lm"] is False
     assert call["beam_width"] == 6
 
+
 def test_websocket_rejects_lm_when_none_loaded(client):
-    with client.websocket_connect(
-        "/v1/audio/transcriptions/stream?use_lm=true"
-    ) as ws:
+    with client.websocket_connect("/v1/audio/transcriptions/stream?use_lm=true") as ws:
         error = ws.receive_json()
         assert error["type"] == "error"
         assert "no KenLM model is loaded" in error["error"]["message"]
+
 
 def test_websocket_rejects_bad_beam_width(client):
     with client.websocket_connect(
@@ -1503,9 +1550,7 @@ def test_api_key_enforced(monkeypatch):
     from app import server
 
     monkeypatch.setattr(server, "engine", FakeEngine())
-    monkeypatch.setattr(
-        server, "settings", replace(server.settings, api_key="sk-test")
-    )
+    monkeypatch.setattr(server, "settings", replace(server.settings, api_key="sk-test"))
     with TestClient(server.app) as client:
         assert client.get("/health").status_code == 200
         denied = client.post(
@@ -1540,7 +1585,9 @@ def test_sea_g2p_postprocess_units():
 
     # 3. PostProcessor with G2P
     proc = PostProcessor(enable_punctuation=True, enable_g2p=True)
-    segs = proc.process_segments([Segment(text="xin chào việt nam", start=0.0, end=1.0)], include_phonemes=True)
+    segs = proc.process_segments(
+        [Segment(text="xin chào việt nam", start=0.0, end=1.0)], include_phonemes=True
+    )
     assert segs[0].phonemes is not None
     assert "Việt Nam" in segs[0].text
 
@@ -1611,3 +1658,366 @@ def test_sea_g2p_websocket_stream_phonemes(client):
                 break
         assert found_phonemes or True  # noqa: SIM222 - session gracefully completed
 
+
+# --------------------------------------------------------------------------- #
+# production hardening
+# --------------------------------------------------------------------------- #
+
+
+def test_busy_engine_sends_retry_after(client):
+    """A retryable 503 must tell the client when to retry."""
+    from app import server
+    from app.engine import EngineBusy
+
+    class BusyEngine(FakeEngine):
+        def transcribe(self, wav, **kwargs):
+            raise EngineBusy("the decode queue is full", retry_after=7)
+
+    original = server.engine
+    server.engine = BusyEngine()
+    try:
+        response = _upload(client)
+        assert response.status_code == 503
+        assert response.headers["retry-after"] == "7"
+    finally:
+        server.engine = original
+
+
+def test_not_ready_sends_retry_after(client):
+    client.fake_engine.is_loaded = False
+    try:
+        response = _upload(client)
+        assert response.status_code == 503
+        assert response.headers["retry-after"] == "5"
+    finally:
+        client.fake_engine.is_loaded = True
+
+
+def test_oversized_job_is_admitted_on_an_idle_engine():
+    """A job larger than the queue cap must not be refused forever."""
+    from app.core import EngineCore
+
+    core = EngineCore(
+        lambda wavs, _ctx: ["" for _ in wavs],
+        sample_rate=100,
+        window_ms=0.0,
+        max_requests=8,
+        batch_seconds=10.0,
+        max_queued_pieces=4,
+    )
+    core.start()
+    try:
+        # Five pieces against a cap of four: previously an instant EngineBusy
+        # even though nothing else was queued.
+        results = core.submit_bulk([np.zeros(5, dtype=np.float32)] * 5, ("s",))
+        assert results == [""] * 5
+        assert core.stats()["shed"] == 0
+    finally:
+        core.stop()
+
+
+def test_upload_limit_is_enforced_while_reading(monkeypatch):
+    """The size cap must apply before the whole body is buffered."""
+    from app import server
+
+    monkeypatch.setattr(server, "engine", FakeEngine())
+    monkeypatch.setattr(server, "settings", replace(server.settings, max_upload_mb=1))
+    with TestClient(server.app) as client:
+        big = b"RIFF" + b"\0" * (2 * 1024 * 1024)
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("big.wav", big, "audio/wav")},
+        )
+        assert response.status_code == 413
+        assert response.json()["error"]["code"] == "payload_too_large"
+
+
+def test_inflight_limit_refuses_with_503(monkeypatch):
+    """Admission control sheds a burst instead of buffering it in memory."""
+    from app import server
+
+    monkeypatch.setattr(server, "engine", FakeEngine())
+    with TestClient(server.app) as client:
+        limiter = server.inflight
+        original_limit = limiter.limit
+        limiter.limit = 1
+        # Hold the only slot, as an in-progress decode would.
+        limiter.acquire()
+        try:
+            response = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("a.wav", wav_bytes(), "audio/wav")},
+            )
+            assert response.status_code == 503
+            assert response.json()["error"]["code"] == "server_busy"
+            assert response.headers["retry-after"] == "1"
+        finally:
+            limiter.release()
+        # Once released, the same request succeeds: the slot is not leaked.
+        assert (
+            client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("a.wav", wav_bytes(), "audio/wav")},
+            ).status_code
+            == 200
+        )
+        assert limiter.active == 0
+        limiter.limit = original_limit
+
+
+def test_parse_rejects_word_granularity():
+    with pytest.raises(APIError) as excinfo:
+        parse_transcription_form(
+            _Form(
+                {"file": object(), "response_format": "verbose_json"},
+                {"timestamp_granularities[]": ["word"]},
+            )
+        )
+    assert excinfo.value.param == "timestamp_granularities[]"
+    assert "word-level timestamps are not available" in excinfo.value.message
+
+
+def test_parse_punctuate_is_tri_state():
+    # Absent: defer to the deployment default.
+    assert parse_transcription_form(_Form({"file": object()})).punctuate is None
+    # Explicit true: opt in for this request alone.
+    explicit = parse_transcription_form(_Form({"file": object(), "punctuate": "true"}))
+    assert explicit.punctuate is True
+    off = parse_transcription_form(_Form({"file": object(), "punctuate": "false"}))
+    assert off.punctuate is False
+
+
+def test_explicit_punctuate_beats_the_server_default(client):
+    """PUNCTUATE=false must not silently ignore ``punctuate=true``."""
+    from app import server
+
+    original = server.settings
+    server.settings = replace(original, enable_punctuation=False)
+    try:
+        plain = client.post(
+            "/v1/audio/transcriptions",
+            data={"response_format": "text"},
+            files={"file": ("a.wav", wav_bytes(), "audio/wav")},
+        )
+        asked = client.post(
+            "/v1/audio/transcriptions",
+            data={"response_format": "text", "punctuate": "true"},
+            files={"file": ("a.wav", wav_bytes(), "audio/wav")},
+        )
+    finally:
+        server.settings = original
+    assert plain.text == "xin chào"
+    assert asked.text == "Xin chào."
+
+
+def test_metrics_keeps_json_for_the_playground(client):
+    body = client.get("/metrics").json()
+    assert "requests_total" in body
+    # Deployment paths stay off the scrape surface.
+    assert "model_path" not in body
+    assert "lm_path" not in body
+
+
+def test_metrics_serves_openmetrics_for_scrapers(client):
+    response = client.get(
+        "/metrics", headers={"Accept": "application/openmetrics-text"}
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/openmetrics-text")
+    text = response.text
+    assert "quan_asr_requests_total 0" in text
+    assert text.rstrip().endswith("# EOF")
+
+
+def test_metrics_honours_api_key(monkeypatch):
+    from app import server
+
+    monkeypatch.setattr(server, "engine", FakeEngine())
+    monkeypatch.setattr(server, "settings", replace(server.settings, api_key="sk-test"))
+    with TestClient(server.app) as client:
+        assert client.get("/metrics").status_code == 401
+        allowed = client.get("/metrics", headers={"Authorization": "Bearer sk-test"})
+        assert allowed.status_code == 200
+
+
+def test_flush_of_a_too_short_buffer_returns_empty():
+    """A flush before the first step must not raise IndexError."""
+    from dataclasses import replace as _replace
+
+    from app.engine import LiveStream
+
+    class StubEngine:
+        settings = _replace(Settings.from_env(), stream_step_seconds=0.48)
+
+        def transcribe(self, _wav, **_kwargs):
+            return []  # below MIN_PIECE_SECONDS: nothing decodes
+
+    live = LiveStream(StubEngine())
+    live._pending = np.zeros(SAMPLE_RATE // 20, dtype=np.float32)
+    assert live.flush() == ""
+
+
+def test_grpc_streaming_recognize_uses_the_real_live_api():
+    """The gRPC servicer must call the engine the way the engine actually works."""
+    pytest.importorskip("grpc")
+    pytest.importorskip("google.protobuf")
+
+    from app.grpc_server import SpeechServicer
+    from app.proto import speech_pb2
+
+    class StubLive:
+        consumed_seconds = 1.44
+        partial = ""
+
+        def accept(self, _samples):
+            return [
+                StreamEvent("partial", "xin", 0.0, 0.48),
+                StreamEvent("final", "xin chao", 0.0, 1.2),
+            ]
+
+        def flush(self):  # returns a str, not events
+            return "ket thuc"
+
+        def close(self):
+            pass
+
+    class StubEngine:
+        settings = Settings.from_env()
+        load_error = None
+        is_loaded = True
+
+        def new_live_session(self, **_kwargs):
+            return StubLive()
+
+    class Context:
+        def abort(self, code, message):  # pragma: no cover - failure path
+            raise AssertionError(f"unexpected abort: {code} {message}")
+
+    def requests():
+        yield speech_pb2.StreamingRecognizeRequest(
+            streaming_config=speech_pb2.StreamingRecognitionConfig(encoding="LINEAR16")
+        )
+        yield speech_pb2.StreamingRecognizeRequest(audio_content=b"\0\0" * 800)
+
+    responses = list(
+        SpeechServicer(StubEngine()).StreamingRecognize(requests(), Context())
+    )
+    transcripts = [
+        (r.results[0].is_final, r.results[0].alternatives[0].transcript)
+        for r in responses
+    ]
+    assert transcripts == [(False, "xin"), (True, "xin chao"), (True, "ket thuc")]
+    # ``result_end_time`` comes from the event's own end, not a made-up duration.
+    assert responses[1].results[0].result_end_time == pytest.approx(1.2)
+    assert responses[2].results[0].result_end_time == pytest.approx(1.44)
+
+
+# --------------------------------------------------------------------------- #
+# punctuator
+# --------------------------------------------------------------------------- #
+
+
+def test_punctuator_defaults_are_off():
+    """The model is opt-in: it adds a dependency and a 116 MB download."""
+    settings = Settings.from_env()
+    assert settings.use_punctuator is False
+    assert settings.punctuator_model == "welcomyou/vibert-capu-onnx"
+    assert settings.punctuator_int8 is True
+    assert settings.punctuator_max_words == 200
+
+
+def test_punctuator_from_env(monkeypatch):
+    monkeypatch.setenv("USE_PUNCTUATOR", "true")
+    monkeypatch.setenv("PUNCTUATOR_MODEL", "/opt/models/vibert-capu")
+    monkeypatch.setenv("PUNCTUATOR_INT8", "false")
+    monkeypatch.setenv("PUNCTUATOR_MAX_WORDS", "64")
+    settings = Settings.from_env()
+    assert settings.use_punctuator is True
+    assert settings.punctuator_model == "/opt/models/vibert-capu"
+    assert settings.punctuator_int8 is False
+    assert settings.punctuator_max_words == 64
+
+
+def test_punctuator_blank_model_falls_back_to_the_hub_id(monkeypatch):
+    monkeypatch.setenv("PUNCTUATOR_MODEL", "   ")
+    assert Settings.from_env().punctuator_model == "welcomyou/vibert-capu-onnx"
+
+
+def test_resolve_model_prefers_an_explicit_directory(tmp_path):
+    """An explicit PUNCTUATOR_MODEL always wins, vendored copy or not."""
+    from app.punctuate import _resolve_model
+
+    assert _resolve_model(str(tmp_path), int8=True) == str(tmp_path)
+
+
+def test_resolve_model_finds_the_vendored_directory(tmp_path, monkeypatch):
+    """A vendored models/vibert-capu is used without touching the Hub."""
+    from app import punctuate
+    from app.punctuate import _resolve_model
+
+    vendored = tmp_path / "models" / "vibert-capu"
+    vendored.mkdir(parents=True)
+    (vendored / punctuate.WEIGHTS["int8"]).write_bytes(b"")
+    monkeypatch.setattr(punctuate, "VENDORED_DIR", str(vendored))
+
+    def explode(*_args, **_kwargs):  # pragma: no cover - must not be reached
+        raise AssertionError("snapshot_download must not run for a vendored model")
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", explode)
+    assert _resolve_model("welcomyou/vibert-capu-onnx", int8=True) == str(vendored)
+
+
+def test_resolve_model_falls_through_when_the_precision_is_missing(
+    tmp_path, monkeypatch
+):
+    """An int8-only vendor must not break an fp32 request."""
+    from app import punctuate
+    from app.punctuate import _resolve_model
+
+    vendored = tmp_path / "models" / "vibert-capu"
+    vendored.mkdir(parents=True)
+    (vendored / punctuate.WEIGHTS["int8"]).write_bytes(b"")
+    monkeypatch.setattr(punctuate, "VENDORED_DIR", str(vendored))
+    monkeypatch.setattr("huggingface_hub.snapshot_download", lambda repo: f"hub:{repo}")
+    assert _resolve_model("welcomyou/vibert-capu-onnx", int8=False) == (
+        "hub:welcomyou/vibert-capu-onnx"
+    )
+
+
+def test_apply_edits_appends_and_capitalises():
+    """The GECToR edit application, independent of the model."""
+    from app.punctuate import apply_edits
+
+    # ``$APPEND_.`` after "nam" (index 2), ``$TRANSFORM_CASE_CAPITAL`` on "xin".
+    edits = [(0, 1, "$TRANSFORM_CASE_CAPITAL"), (3, 3, ".")]
+    assert apply_edits(["xin", "chao", "nam"], edits) == ["Xin", "chao", "nam", "."]
+
+
+def test_apply_edits_ignores_a_duplicate_append():
+    """The model can fire the same append on two adjacent words."""
+    from app.punctuate import apply_edits
+
+    assert apply_edits(["a", "b"], [(1, 1, "."), (2, 2, ".")]) == ["a", ".", "b"]
+
+
+def test_apply_edits_resolves_merge_space():
+    from app.punctuate import apply_edits
+
+    assert apply_edits(["mobi", "fone"], [(1, 1, "$MERGE_SPACE")]) == ["mobifone"]
+
+
+def test_edit_for_shifts_past_the_start_sentinel():
+    """``$START`` occupies padded index 0, so token coordinates shift by one."""
+    from app.punctuate import edit_for
+
+    assert edit_for(0, "$KEEP") is None
+    assert edit_for(1, "$TRANSFORM_CASE_CAPITAL") == (0, 1, "$TRANSFORM_CASE_CAPITAL")
+    assert edit_for(2, "$APPEND_,") == (2, 2, ",")
+
+
+def test_punctuator_is_disabled_without_the_flag():
+    """``engine.punctuator`` is None unless USE_PUNCTUATOR is set."""
+    from app.engine import TranscriptionEngine
+
+    engine = TranscriptionEngine(Settings.from_env().merge(use_punctuator=False))
+    assert engine.punctuator is None

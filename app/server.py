@@ -22,11 +22,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import json
 import logging
 import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -67,8 +68,68 @@ settings = Settings.from_env()
 engine = TranscriptionEngine(settings)
 
 #: Extra model names OpenAI clients tend to send.
-_ALIASES = {"whisper-1", "quan-transcribe", "quan-transcribe-1.0", "quan-asr", "quan-asr-server"}
+_ALIASES = {
+    "whisper-1",
+    "quan-transcribe",
+    "quan-transcribe-1.0",
+    "quan-asr",
+    "quan-asr-server",
+}
 _active_websockets = 0
+
+#: Chunk size for the bounded upload read; small enough that a truncated body
+#: is detected without ever buffering it whole.
+_UPLOAD_CHUNK = 1 << 20
+
+
+class _InflightLimiter:
+    """Admission control for buffered transcriptions.
+
+    ``MAX_QUEUE`` bounds audio *pieces* inside the engine, which is too late to
+    protect memory: every accepted upload already holds its decoded waveform.
+    This caps how many requests may be decoded-and-waiting at once, so a burst is
+    refused with a fast ``503`` instead of an OOM.
+
+    A plain counter rather than an ``asyncio.Semaphore``: the slot is refused
+    immediately by design (the client retries), so there is nothing to wait for,
+    and a counter has no event-loop affinity to worry about.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self._active = 0
+
+    @property
+    def active(self) -> int:
+        return self._active
+
+    def acquire(self) -> None:
+        if self.limit <= 0:
+            return
+        if self._active >= self.limit:
+            raise APIError(
+                f"too many transcriptions in flight (limit {self.limit}); retry shortly",
+                status_code=503,
+                code="server_busy",
+                error_type="server_error",
+                headers={"Retry-After": "1"},
+            )
+        self._active += 1
+
+    def release(self) -> None:
+        if self.limit > 0 and self._active > 0:
+            self._active -= 1
+
+    @asynccontextmanager
+    async def slot(self) -> AsyncIterator[None]:
+        self.acquire()
+        try:
+            yield
+        finally:
+            self.release()
+
+
+inflight = _InflightLimiter(settings.max_inflight_requests)
 
 
 # --------------------------------------------------------------------------- #
@@ -91,10 +152,14 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     )
     preload_task: asyncio.Task[None] | None = None
     if settings.preload:
+
         async def _preload_model() -> None:
             try:
                 await run_in_threadpool(engine.load)
                 await run_in_threadpool(engine.warmup)
+                # The punctuation model is optional and its failure is not
+                # fatal, so it loads after the ASR model is known good.
+                await run_in_threadpool(engine.load_punctuator)
                 logger.info("model preload and warmup complete; engine is ready")
             except EngineNotReady as exc:
                 # Do not crash the container: /health reports the failure so an
@@ -160,7 +225,11 @@ app.add_middleware(
 
 @app.exception_handler(APIError)
 async def _api_error_handler(_: Request, exc: APIError) -> JSONResponse:
-    return JSONResponse(status_code=exc.status_code, content=exc.to_payload())
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=exc.to_payload(),
+        headers=exc.headers or None,
+    )
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -182,6 +251,12 @@ async def _validation_error_handler(
     return JSONResponse(status_code=400, content=error.to_payload())
 
 
+def _token_matches(token: str) -> bool:
+    """Compare a presented token with the configured key in constant time."""
+    expected = settings.api_key or ""
+    return hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8"))
+
+
 def require_api_key(request: Request) -> None:
     """Enforce ``API_KEY`` when one is configured, mirroring OpenAI bearer auth."""
     if not settings.api_key:
@@ -190,7 +265,7 @@ def require_api_key(request: Request) -> None:
     token = header[7:].strip() if header.lower().startswith("bearer ") else ""
     if not token:
         token = request.headers.get("x-api-key", "").strip()
-    if token != settings.api_key:
+    if not _token_matches(token):
         raise APIError(
             "invalid API key",
             status_code=401,
@@ -249,8 +324,49 @@ def _decode_upload(data: bytes) -> np.ndarray:
     return wav
 
 
+async def _read_upload(file: UploadFile) -> bytes:
+    """Buffer an upload, refusing it as soon as it passes ``MAX_UPLOAD_MB``.
+
+    Reading in chunks matters: ``await file.read()`` materialises the whole body
+    before the size check can run, so a 200 MB limit would not stop a 2 GB
+    upload from being held in memory first.
+    """
+    max_bytes = settings.max_upload_mb * 1024 * 1024
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(_UPLOAD_CHUNK)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise APIError(
+                f"the audio file exceeds the {settings.max_upload_mb} MB limit",
+                status_code=413,
+                code="payload_too_large",
+            )
+        chunks.append(chunk)
+    data = b"".join(chunks)
+    if not data:
+        raise APIError("the uploaded file is empty", code="invalid_audio_file")
+    return data
+
+
 def _sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _wants_punctuation(params: TranscriptionParams) -> bool:
+    """Resolve the request's punctuation wish against the deployment default.
+
+    ``punctuate`` is tri-state on the request: an explicit value wins (so a
+    client can ask for punctuation on a server that defaults it off), and only
+    an absent field falls back to ``PUNCTUATE``. Silently ignoring an explicit
+    request is what the old ``and settings.enable_punctuation`` did.
+    """
+    if params.punctuate is None:
+        return settings.enable_punctuation
+    return params.punctuate
 
 
 def _shape_segments(
@@ -387,14 +503,64 @@ async def live_probe() -> dict[str, Any]:
     return {"live": True, "status": "ok"}
 
 
-@app.get("/metrics")
-async def metrics() -> dict[str, Any]:
+#: ``engine.info()`` keys that describe the deployment rather than the workload.
+#: They reveal filesystem layout and load failures, which is too much for an
+#: endpoint a scraper may reach without credentials.
+_SENSITIVE_INFO = {"lm_path", "model_path", "load_error"}
+
+
+@app.get("/metrics", dependencies=[Depends(require_api_key)])
+async def metrics(request: Request) -> Response:
+    """Counters plus a realtime factor.
+
+    JSON stays the default so the bundled playground can ``res.json()`` it;
+    Prometheus scrapers that ask for OpenMetrics (or plain text) get the text
+    exposition format instead.
+    """
     base = {**engine.metrics(), **engine.info()}
     base["active_streams"] = _active_websockets
-    base["queue_size"] = (
-        base.get("core", {}).get("queued_pieces", 0) if isinstance(base.get("core"), dict) else 0
+    core = base.get("core")
+    base["queue_size"] = core.get("queued_pieces", 0) if isinstance(core, dict) else 0
+    # Deployment paths and load failures belong on /health, behind the operator's
+    # own access control, not on a scrape endpoint.
+    public = {k: v for k, v in base.items() if k not in _SENSITIVE_INFO}
+
+    accept = request.headers.get("accept", "")
+    wants_text = "openmetrics-text" in accept or (
+        "text/plain" in accept and "application/json" not in accept
     )
-    return base
+    if not wants_text:
+        return JSONResponse(public)
+
+    body, media_type = _render_openmetrics(public)
+    return Response(content=body, media_type=media_type)
+
+
+def _render_openmetrics(payload: dict[str, Any]) -> tuple[str, str]:
+    """Flatten the metrics dict into the Prometheus text exposition format."""
+    lines: list[str] = []
+
+    def emit(name: str, value: Any, kind: str = "gauge") -> None:
+        metric = f"quan_asr_{name}"
+        if isinstance(value, bool):
+            value = int(value)
+        if not isinstance(value, (int, float)):
+            return
+        lines.append(f"# TYPE {metric} {kind}")
+        lines.append(f"{metric} {value}")
+
+    for key, value in sorted(payload.items()):
+        if key in _SENSITIVE_INFO:
+            continue
+        if key == "core" and isinstance(value, dict):
+            for core_key, core_value in sorted(value.items()):
+                emit(f"core_{core_key}", core_value)
+            continue
+        emit(key, value)
+    lines.append("# EOF")
+    return "\n".join(
+        lines
+    ) + "\n", "application/openmetrics-text; version=1.0.0; charset=utf-8"
 
 
 @app.get("/v1/models")
@@ -434,24 +600,47 @@ async def transcribe(
     params = parse_transcription_form(form)
 
     # Support stream flag from Form, URL Query params (e.g. ?stream=true / ?enable_streaming=true)
-    query_stream = (
-        request.query_params.get("stream", "").strip().lower() in ("true", "1", "yes", "on")
-        or request.query_params.get("enable_streaming", "").strip().lower() in ("true", "1", "yes", "on")
+    query_stream = request.query_params.get("stream", "").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+        "on",
+    ) or request.query_params.get("enable_streaming", "").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+        "on",
     )
     form_stream = False
     if form.get("enable_streaming") not in (None, ""):
-        form_stream = str(form.get("enable_streaming")).strip().lower() in ("true", "1", "yes", "on")
+        form_stream = str(form.get("enable_streaming")).strip().lower() in (
+            "true",
+            "1",
+            "yes",
+            "on",
+        )
 
     # The typed declarations are authoritative for the fields they cover.
     params.streaming = bool(stream) or params.streaming or query_stream or form_stream
     params.streaming_partials = bool(stream_partials)
     params.response_format = (
-        response_format or form.get("response_format") or request.query_params.get("response_format") or "json"
-    ).strip().lower()
+        (
+            response_format
+            or form.get("response_format")
+            or request.query_params.get("response_format")
+            or "json"
+        )
+        .strip()
+        .lower()
+    )
 
-    effective_language = language or form.get("language") or request.query_params.get("language")
+    effective_language = (
+        language or form.get("language") or request.query_params.get("language")
+    )
     if effective_language:
-        params.language = str(effective_language).strip().lower().split("-")[0].split("_")[0]
+        params.language = (
+            str(effective_language).strip().lower().split("-")[0].split("_")[0]
+        )
 
     _check_model(model or form.get("model") or request.query_params.get("model"))
     if params.response_format not in MEDIA_TYPES:
@@ -476,56 +665,79 @@ async def transcribe(
             status_code=503,
             code="model_loading",
             error_type="server_error",
+            headers={"Retry-After": "5"},
         )
 
-    data = await file.read()
-    if not data:
-        raise APIError("the uploaded file is empty", code="invalid_audio_file")
-    max_bytes = settings.max_upload_mb * 1024 * 1024
-    if len(data) > max_bytes:
-        raise APIError(
-            f"the audio file exceeds the {settings.max_upload_mb} MB limit",
-            status_code=413,
-            code="payload_too_large",
-        )
-
-    wav = _decode_upload(data)
-    duration = wav.size / SAMPLE_RATE
-    model_name = settings.served_model_name
+    data = await _read_upload(file)
 
     if params.streaming:
-        return _streaming_response(wav, params, duration, model_name)
+        # The slot stays taken until the SSE generator finishes, because the
+        # decoded waveform is alive for the whole stream. If building the
+        # response fails, the slot is handed back here.
+        inflight.acquire()
+        try:
+            wav = await run_in_threadpool(_decode_upload, data)
+            return _streaming_response(
+                wav,
+                params,
+                wav.size / SAMPLE_RATE,
+                settings.served_model_name,
+                release=inflight.release,
+            )
+        except BaseException:
+            inflight.release()
+            raise
 
-    try:
-        segments = await run_in_threadpool(
-            engine.transcribe,
-            wav,
-            streaming=False,
-            left_chunks=params.left_chunks,
-            chunk_seconds=params.chunk_seconds,
-            use_lm=params.use_lm,
-            beam_width=params.beam_width,
-        )
-    except EngineBusy as exc:
-        # The decode queue is full. Refusing fast is the point of backpressure:
-        # a 503 the client can retry beats a request that hangs for minutes.
-        raise APIError(
-            str(exc),
-            status_code=503,
-            code="server_busy",
-            error_type="server_error",
-        ) from exc
-    except EngineNotReady as exc:
-        raise APIError(str(exc), status_code=503, error_type="server_error") from exc
+    # Decoding is CPU-bound (ffmpeg + resample over the whole file) and used to
+    # run inline here, freezing every other connection for the duration.
+    async with inflight.slot():
+        wav = await run_in_threadpool(_decode_upload, data)
+        duration = wav.size / SAMPLE_RATE
+        model_name = settings.served_model_name
+
+        try:
+            segments = await run_in_threadpool(
+                engine.transcribe,
+                wav,
+                streaming=False,
+                left_chunks=params.left_chunks,
+                chunk_seconds=params.chunk_seconds,
+                use_lm=params.use_lm,
+                beam_width=params.beam_width,
+            )
+        except EngineBusy as exc:
+            # The decode queue is full. Refusing fast is the point of
+            # backpressure: a 503 the client can retry beats a request that
+            # hangs for minutes.
+            raise APIError(
+                str(exc),
+                status_code=503,
+                code="server_busy",
+                error_type="server_error",
+                headers={"Retry-After": str(exc.retry_after)},
+            ) from exc
+        except EngineNotReady as exc:
+            raise APIError(
+                str(exc),
+                status_code=503,
+                error_type="server_error",
+                headers={"Retry-After": "5"},
+            ) from exc
 
     segments = _shape_segments(segments, params)
     processor = (
-        PostProcessor(norm_mode=params.norm_mode, enable_g2p=params.phonemes)
-        if (params.norm_mode != "itn" or params.phonemes)
+        PostProcessor(
+            norm_mode=params.norm_mode,
+            enable_g2p=params.phonemes,
+            punctuator=engine.punctuator,
+        )
+        if (params.norm_mode != "itn" or params.phonemes or engine.punctuator)
         else default_post_processor
     )
-    if params.punctuate and settings.enable_punctuation:
-        segments = processor.process_segments(segments, include_phonemes=params.phonemes)
+    if _wants_punctuation(params):
+        segments = processor.process_segments(
+            segments, include_phonemes=params.phonemes
+        )
     elif params.phonemes:
         for seg in segments:
             seg.phonemes = to_phonemes(seg.text)
@@ -567,8 +779,13 @@ def _streaming_response(
     params: TranscriptionParams,
     duration: float,
     model_name: str,
+    release: Callable[[], None] | None = None,
 ) -> Response:
-    """Build the Server-Sent Events response for ``stream=true``."""
+    """Build the Server-Sent Events response for ``stream=true``.
+
+    ``release`` is called exactly once when the stream ends, disconnects or
+    fails, so the admission-control slot taken by the caller is not leaked.
+    """
 
     async def events() -> AsyncIterator[str]:
         started = time.perf_counter()
@@ -602,6 +819,7 @@ def _streaming_response(
                 emit(None)
 
         worker = loop.run_in_executor(None, produce)
+        punctuate = _wants_punctuation(params)
         finals: list[str] = []
         try:
             while True:
@@ -610,8 +828,10 @@ def _streaming_response(
                     break
                 if payload.get("type") == "transcript.text.segment":
                     seg_text = payload["text"]
-                    if params.punctuate and settings.enable_punctuation:
-                        seg_text = default_post_processor.process(seg_text, is_final=False)
+                    if punctuate:
+                        seg_text = default_post_processor.process(
+                            seg_text, is_final=False
+                        )
                         payload["text"] = seg_text
                     if params.phonemes and seg_text:
                         payload["phonemes"] = to_phonemes(seg_text)
@@ -628,18 +848,24 @@ def _streaming_response(
         finally:
             stop.set()
             await worker
+            if release is not None:
+                release()
 
         # A final summary event carrying the whole transcript, so a client that
         # only looks at the last event still gets the text.
         full_transcript = " ".join(t for t in finals if t).strip()
-        if params.punctuate and settings.enable_punctuation and full_transcript:
-            full_transcript = default_post_processor.process(full_transcript, is_final=True)
+        if punctuate and full_transcript:
+            full_transcript = default_post_processor.process(
+                full_transcript, is_final=True
+            )
 
         done_event: dict[str, Any] = {
             "type": "transcript.text.done",
             "text": full_transcript,
             "delta": "",
-            "choices": [{"delta": {"content": ""}, "finish_reason": "stop", "index": 0}],
+            "choices": [
+                {"delta": {"content": ""}, "finish_reason": "stop", "index": 0}
+            ],
             "duration": round(duration, 3),
             "model": model_name,
             "language": "vi",
@@ -708,7 +934,9 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                 "error": {
                     "message": msg,
                     "type": "server_error",
-                    "code": "model_loading" if not engine.load_error else "model_load_error",
+                    "code": "model_loading"
+                    if not engine.load_error
+                    else "model_load_error",
                 },
             }
         )
@@ -719,7 +947,7 @@ async def transcribe_stream(websocket: WebSocket) -> None:
         header = websocket.headers.get("authorization", "")
         token = header[7:].strip() if header.lower().startswith("bearer ") else ""
         token = token or websocket.query_params.get("api_key", "")
-        if token != settings.api_key:
+        if not _token_matches(token):
             await websocket.send_json(
                 {
                     "type": "error",
@@ -814,13 +1042,17 @@ async def transcribe_stream(websocket: WebSocket) -> None:
     global _active_websockets
     _active_websockets += 1
 
-    raw_punc = websocket.query_params.get("punctuate") or websocket.query_params.get("enable_punctuation")
+    raw_punc = websocket.query_params.get("punctuate") or websocket.query_params.get(
+        "enable_punctuation"
+    )
     should_punctuate = (
         raw_punc.strip().lower() in ("1", "true", "yes", "on")
         if raw_punc is not None
         else settings.enable_punctuation
     )
-    raw_phonemes = websocket.query_params.get("phonemes") or websocket.query_params.get("g2p")
+    raw_phonemes = websocket.query_params.get("phonemes") or websocket.query_params.get(
+        "g2p"
+    )
     include_phonemes = (
         raw_phonemes.strip().lower() in ("1", "true", "yes", "on")
         if raw_phonemes is not None

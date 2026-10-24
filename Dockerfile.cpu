@@ -32,16 +32,26 @@ COPY pyproject.toml README.md ./
 COPY app ./app
 COPY quan_transcribe ./quan_transcribe
 COPY samples ./samples
+COPY scripts/fetch_punctuator.py ./scripts/fetch_punctuator.py
 
 ARG INSTALL_LM=true
 ARG INSTALL_VAD=true
+ARG INSTALL_PUNCTUATOR=true
 RUN extras="" ; \
     if [ "$INSTALL_LM" = "true" ]; then extras="${extras}lm"; fi ; \
     if [ "$INSTALL_VAD" = "true" ]; then extras="${extras:+$extras,}vad"; fi ; \
+    if [ "$INSTALL_PUNCTUATOR" = "true" ]; then extras="${extras:+$extras,}punctuate"; fi ; \
     if [ -n "$extras" ]; then \
         uv pip install ".[${extras}]" ; \
     else \
         uv pip install . ; \
+    fi
+
+# Bake the vibert-capu punctuator into the image so the container never reaches
+# the Hub for it at runtime. The weights are CC-BY-SA-4.0; see app/punctuate.py.
+# Set INSTALL_PUNCTUATOR=false to skip both the extra and the 116 MB download.
+RUN if [ "$INSTALL_PUNCTUATOR" = "true" ]; then \
+        /opt/venv/bin/python scripts/fetch_punctuator.py --out /opt/models/vibert-capu ; \
     fi
 
 # Clean up uv cache
@@ -66,6 +76,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
+# The punctuator weights baked in by the builder stage. PUNCTUATOR_MODEL points
+# at them so app/punctuate.py never downloads anything at runtime.
+COPY --from=builder /opt/models /opt/models
+
 COPY pyproject.toml README.md ./
 COPY app ./app
 COPY quan_transcribe ./quan_transcribe
@@ -77,6 +91,7 @@ ENV HF_HOME=/cache/huggingface \
     PYTHONDONTWRITEBYTECODE=1 \
     MODEL_PATH=qnguyen3/QUAN-Transcribe-1.0 \
     SERVED_MODEL_NAME=QUAN-Transcribe-1.0 \
+    PUNCTUATOR_MODEL=/opt/models/vibert-capu \
     HOST=0.0.0.0 \
     PORT=8000 \
     DEVICE=cpu \

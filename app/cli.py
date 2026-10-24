@@ -34,7 +34,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         dest="model_path",
         default=None,
-        help="Hugging Face repo id or local model directory",
+        help="Hugging Face repo id or local model directory, in either supported "
+        "layout (config.json + units.json + model.safetensors, or a single "
+        "*.pt holding model/model_config/gemma_ids)",
     )
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
@@ -56,8 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lm-path",
         default=None,
-        help="your own KenLM model: a .bin/.arpa file, or a directory with "
-        "vi_4gram.bin and optionally unigrams.txt/lm_config.json",
+        help="your own KenLM model: a .bin/.arpa file, or a directory holding a "
+        "KenLM .bin (*.unigrams.txt and lm_config.json are optional)",
     )
     parser.add_argument(
         "--beam-width",
@@ -69,13 +71,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--lm-alpha",
         type=float,
         default=None,
-        help="LM weight; defaults to the value in lm_config.json (0.3)",
+        help="LM weight; defaults to lm_config.json, else the model family's "
+        "tuned value (0.3 safetensors, 0.35 torch)",
     )
     parser.add_argument(
         "--lm-beta",
         type=float,
         default=None,
-        help="word-insertion bonus; defaults to the value in lm_config.json (1.0)",
+        help="word-insertion bonus; defaults to lm_config.json, else the model "
+        "family's tuned value (1.0 safetensors, 1.5 torch)",
     )
     parser.add_argument(
         "--left-chunks",
@@ -118,10 +122,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-interactive",
         type=int,
         default=None,
-        help="most streaming (interactive) jobs in flight; 0 is unbounded "
-        "(default 64)",
+        help="most streaming (interactive) jobs in flight; 0 is unbounded (default 64)",
     )
-    parser.add_argument("--cpu-threads",
+    parser.add_argument(
+        "--cpu-threads",
         type=int,
         default=None,
         help="torch CPU thread count for the CPU profile (default: auto)",
@@ -149,6 +153,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-tf32",
         action="store_true",
         help="disable TF32 matmuls on Ampere+ (exact FP32, slower)",
+    )
+    parser.add_argument(
+        "--punctuate",
+        action="store_true",
+        default=None,
+        help="restore punctuation and capitalization with the vibert-capu "
+        "ViBERT model (needs the 'punctuate' extra; the regex fallback can "
+        "only append '.' or '?')",
+    )
+    parser.add_argument(
+        "--punctuator-model",
+        default=None,
+        help="Hugging Face repo id or local directory holding the ONNX export "
+        "(default welcomyou/vibert-capu-onnx)",
+    )
+    parser.add_argument(
+        "--no-punctuator-int8",
+        action="store_true",
+        help="use the fp32 ONNX build (438 MB) instead of int8 (110 MB)",
     )
     parser.add_argument("--api-key", default=None)
     parser.add_argument(
@@ -192,6 +215,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "vad_speech_pad_ms": args.vad_speech_pad_ms,
         "vad_trim_silence": False if args.no_vad_trim else None,
         "tf32": False if args.no_tf32 else None,
+        "use_punctuator": True if args.punctuate else None,
+        "punctuator_model": args.punctuator_model,
+        "punctuator_int8": False if args.no_punctuator_int8 else None,
         "api_key": args.api_key,
         "log_level": args.log_level,
         "preload": False if args.no_preload else None,
@@ -252,6 +278,8 @@ _ENV_FOR_SETTING = {
     "api_key": "API_KEY",
     "log_level": "LOG_LEVEL",
     "preload": "PRELOAD",
+    "use_lm": "USE_LM",
+    "use_vad": "USE_VAD",
 }
 
 

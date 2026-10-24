@@ -1,5 +1,6 @@
 """High-level API: load a QUAN-Transcribe checkpoint and turn audio into text."""
 
+import glob
 import json
 import os
 
@@ -13,18 +14,60 @@ from .audio import SAMPLE_RATE, load_audio, split_quiet, to_16k_mono
 from .model import ModelConfig, QuanCTC, greedy_decode, load_encoder
 
 DEFAULT_MODEL = "qnguyen3/QUAN-Transcribe-1.0"
-MODEL_FILES = ["config.json", "units.json", "model.safetensors"]
+# Two checkpoint layouts are supported:
+#   safetensors: config.json + units.json + model.safetensors   (qnguyen3/QUAN-Transcribe-1.0)
+#   torch:       <name>.pt holding model/model_config/gemma_ids  (5CD-AI/VieGem-ASR)
+SAFETENSORS_FILE = "model.safetensors"
+MODEL_FILES = ["config.json", "units.json", SAFETENSORS_FILE]
+TORCH_FILES = ["*.pt"]
 LM_DIR = "lm"  # optional n-gram LM inside the model repo: lm/vi_4gram.bin, lm/unigrams.txt, lm/lm_config.json
 LM_FILE, UNIGRAMS_FILE, LM_CONFIG_FILE = "vi_4gram.bin", "unigrams.txt", "lm_config.json"
+# Beam-search LM weights each checkpoint family was tuned with (used when lm_config.json is absent).
+LM_DEFAULTS = {"safetensors": (0.3, 1.0), "torch": (0.35, 1.5)}
 
 AudioInput = str | os.PathLike | np.ndarray | torch.Tensor
-
 
 def default_device() -> str:
     if torch.cuda.is_available():
         return "cuda"
     return "mps" if torch.backends.mps.is_available() else "cpu"
 
+def _find_file(directory: str, preferred: str, pattern: str) -> str | None:
+    path = os.path.join(directory, preferred)
+    if os.path.exists(path):
+        return path
+    matches = sorted(glob.glob(os.path.join(directory, pattern)))
+    return matches[0] if matches else None
+
+def _load_checkpoint(path: str) -> tuple[ModelConfig, list[int], str, dict]:
+    """Read either supported checkpoint layout, returning (config, gemma_ids, tokenizer id, state dict)."""
+    config_path = os.path.join(path, "config.json")
+    units_path = os.path.join(path, "units.json")
+    safetensors_path = os.path.join(path, SAFETENSORS_FILE)
+    if os.path.exists(config_path) and os.path.exists(safetensors_path):
+        with open(config_path) as f:
+            cfg = ModelConfig.from_dict(json.load(f))
+        if not os.path.exists(units_path):
+            raise RuntimeError(f"{units_path} is missing (it holds the 'gemma_ids' unit mapping)")
+        with open(units_path) as f:
+            units = json.load(f)
+        if "gemma_ids" not in units:
+            raise RuntimeError(f"{units_path} is missing 'gemma_ids'")
+        return cfg, units["gemma_ids"], units.get("model_id", cfg.encoder_id), load_file(safetensors_path)
+
+    torch_paths = sorted(glob.glob(os.path.join(path, "*.pt")))
+    if torch_paths:
+        ck = torch.load(torch_paths[0], map_location="cpu", weights_only=True)
+        missing = [k for k in ("model", "model_config", "gemma_ids") if k not in ck]
+        if missing:
+            raise RuntimeError(f"{torch_paths[0]} is missing {missing}")
+        cfg = ModelConfig.from_dict(ck["model_config"])
+        return cfg, ck["gemma_ids"], cfg.encoder_id, ck["model"]
+
+    raise RuntimeError(
+        f"no supported checkpoint in {path}: expected either "
+        f"{', '.join(MODEL_FILES)} or a single *.pt (e.g. viegem_asr.pt)"
+    )
 
 class QuanTranscribe:
     def __init__(self, model: QuanCTC, tokenizer, gemma_ids: list[int], device: torch.device):
@@ -33,6 +76,7 @@ class QuanTranscribe:
         self.gemma_ids = gemma_ids
         self.device = device
         self.lm_decoder = None
+        self.lm_defaults = LM_DEFAULTS["safetensors"]
 
     @classmethod
     def from_pretrained(
@@ -43,7 +87,11 @@ class QuanTranscribe:
         token: str | bool | None = None,
         lm: bool | str = False,
     ) -> "QuanTranscribe":
-        """Load from a Hugging Face repo id or a local directory with config.json, units.json, model.safetensors.
+        """Load from a Hugging Face repo id or a local directory holding a supported checkpoint.
+
+        Two layouts are accepted:
+          * config.json + units.json + model.safetensors  (qnguyen3/QUAN-Transcribe-1.0)
+          * a single *.pt with model/model_config/gemma_ids  (5CD-AI/VieGem-ASR)
 
         The base encoder google/embeddinggemma-2 is downloaded on first use (accept its terms on the HF page).
         lm: True loads the n-gram LM shipped with the model (needs `pip install kenlm`); a path loads your own
@@ -52,23 +100,23 @@ class QuanTranscribe:
         if os.path.isdir(model_id):
             path = model_id
         else:
-            path = snapshot_download(model_id, revision=revision, token=token, allow_patterns=MODEL_FILES)
-        with open(os.path.join(path, "config.json")) as f:
-            cfg = ModelConfig.from_dict(json.load(f))
-        with open(os.path.join(path, "units.json")) as f:
-            units = json.load(f)
+            path = snapshot_download(
+                model_id, revision=revision, token=token, allow_patterns=MODEL_FILES + TORCH_FILES
+            )
+        cfg, gemma_ids, tokenizer_id, state = _load_checkpoint(path)
+        layout = "safetensors" if os.path.exists(os.path.join(path, SAFETENSORS_FILE)) else "torch"
 
         device = torch.device(device or default_device())
         model = QuanCTC(cfg, load_encoder(cfg.encoder_id))
         # The checkpoint holds the reader + the fine-tuned top encoder layers; the rest comes from the base model.
-        state = load_file(os.path.join(path, "model.safetensors"))
         missing, unexpected = model.load_state_dict(state, strict=False)
         missing = [k for k in missing if not k.startswith("encoder.")]
         if missing or unexpected:
             raise RuntimeError(f"checkpoint does not match the model: missing={missing} unexpected={unexpected}")
         model = model.to(device).eval()
-        tokenizer = AutoTokenizer.from_pretrained(units.get("model_id", cfg.encoder_id))
-        asr = cls(model, tokenizer, units["gemma_ids"], device)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
+        asr = cls(model, tokenizer, gemma_ids, device)
+        asr.lm_defaults = LM_DEFAULTS[layout]
         if lm is True:
             if os.path.isdir(model_id):
                 lm = os.path.join(path, LM_DIR)
@@ -84,19 +132,25 @@ class QuanTranscribe:
     ) -> None:
         """Enable beam-search decoding with a word-level KenLM model.
 
-        path: a directory with vi_4gram.bin (+ optional unigrams.txt, lm_config.json), or a KenLM .bin/.arpa file.
-        alpha (LM weight) and beta (word bonus) default to lm_config.json, else 0.3 / 1.0.
+        path: a directory with the model's LM files (vi_4gram.bin + optional unigrams.txt and lm_config.json for
+        QUAN-Transcribe-1.0, viegem_lm.bin + viegem_lm.unigrams.txt for VieGem-ASR), or a KenLM .bin/.arpa file.
+        alpha (LM weight) and beta (word bonus) default to lm_config.json, else the value the checkpoint was tuned
+        with: 0.3 / 1.0 for QUAN-Transcribe-1.0, 0.35 / 1.5 for VieGem-ASR.
         """
         from .lm import KenLMDecoder
 
         cfg = {}
+        default_alpha, default_beta = self.lm_defaults
         if os.path.isdir(path):
-            if unigrams is None and os.path.exists(os.path.join(path, UNIGRAMS_FILE)):
-                unigrams = os.path.join(path, UNIGRAMS_FILE)
-            if os.path.exists(os.path.join(path, LM_CONFIG_FILE)):
-                with open(os.path.join(path, LM_CONFIG_FILE)) as f:
+            directory = path
+            if unigrams is None:
+                unigrams = _find_file(directory, UNIGRAMS_FILE, "*.unigrams.txt")
+            if os.path.exists(os.path.join(directory, LM_CONFIG_FILE)):
+                with open(os.path.join(directory, LM_CONFIG_FILE)) as f:
                     cfg = json.load(f)
-            path = os.path.join(path, LM_FILE)
+            path = _find_file(directory, LM_FILE, "*.bin")
+            if path is None:
+                raise RuntimeError(f"no KenLM .bin file found in {directory}")
         words = None
         if unigrams:
             with open(unigrams, encoding="utf-8") as f:
@@ -105,8 +159,8 @@ class QuanTranscribe:
         pieces = ["", ""] + self.tokenizer.convert_ids_to_tokens(self.gemma_ids)
         self.lm_decoder = KenLMDecoder(
             path, pieces, words,
-            alpha=cfg.get("alpha", 0.3) if alpha is None else alpha,
-            beta=cfg.get("beta", 1.0) if beta is None else beta,
+            alpha=cfg.get("alpha", default_alpha) if alpha is None else alpha,
+            beta=cfg.get("beta", default_beta) if beta is None else beta,
         )
 
     def decode_units(self, unit_ids: list[int]) -> str:

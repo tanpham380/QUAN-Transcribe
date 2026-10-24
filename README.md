@@ -143,11 +143,11 @@ quan-transcribe --mic             # live from the microphone, Ctrl+C to stop
 
 ```python
 # continuing from Quickstart, with the same `asr`
-print(asr.transcribe("audio.wav", streaming=True))     # streaming decoding
-print(asr.transcribe("audio.wav", use_lm=True))        # beam search (after loading an LM)
+print(asr.transcribe("audio.wav", streaming=True))  # streaming decoding
+print(asr.transcribe("audio.wav", use_lm=True))  # beam search (after loading an LM)
 
 # waveforms and batches work too
-texts = asr.transcribe([wav_a, wav_b], sample_rate=16000)   # -> list[str]
+texts = asr.transcribe([wav_a, wav_b], sample_rate=16000)  # -> list[str]
 ```
 
 - **Input:** any file libsndfile can read (wav, flac, ogg, mp3, ...), or a numpy/torch waveform. Audio is converted
@@ -186,10 +186,10 @@ quan-transcribe --mic > notes.txt            # when piped, only finished sentenc
 from quan_transcribe.live import LiveSession
 
 session = LiveSession(asr)
-for block in blocks:                          # 16 kHz mono float32 audio, any block size
-    for sentence in session.accept(block):    # finished sentences
+for block in blocks:  # 16 kHz mono float32 audio, any block size
+    for sentence in session.accept(block):  # finished sentences
         print(sentence)
-    print(session.partial)                    # sentence in progress
+    print(session.partial)  # sentence in progress
 print(session.flush())
 ```
 
@@ -208,8 +208,8 @@ quan-transcribe --lm audio.wav
 
 ```python
 asr = QuanTranscribe.from_pretrained("qnguyen3/QUAN-Transcribe-1.0", lm=True)
-asr.transcribe("audio.wav")                  # beam search with the LM
-asr.transcribe("audio.wav", use_lm=False)    # greedy
+asr.transcribe("audio.wav")  # beam search with the LM
+asr.transcribe("audio.wav", use_lm=False)  # greedy
 ```
 
 - **Tuning:** `beam_width` / `--beam-width` (default 32), `--lm-alpha` (LM weight), `--lm-beta` (word bonus).
@@ -231,17 +231,17 @@ from quan_transcribe import QuanTranscribe
 
 asr = QuanTranscribe.from_pretrained(
     "qnguyen3/QUAN-Transcribe-1.0",  # HF repo id or a local directory
-    device=None,                     # "cuda", "cuda:1", "mps", "cpu" (default: auto)
-    revision=None,                   # HF revision / commit
-    token=None,                      # HF token for gated downloads
-    lm=False,                        # True loads the shipped LM; a path loads your own
+    device=None,  # "cuda", "cuda:1", "mps", "cpu" (default: auto)
+    revision=None,  # HF revision / commit
+    token=None,  # HF token for gated downloads
+    lm=False,  # True loads the shipped LM; a path loads your own
 )
 
-asr.transcribe("audio.wav")                        # -> str
-asr.transcribe(["a.wav", "b.wav"])                 # -> list[str]
-asr.transcribe(wav, sample_rate=16000)             # numpy / torch waveform
-asr.transcribe("audio.wav", streaming=True)        # streaming decoding
-asr.transcribe("audio.wav", beam_width=8)          # smaller LM beam
+asr.transcribe("audio.wav")  # -> str
+asr.transcribe(["a.wav", "b.wav"])  # -> list[str]
+asr.transcribe(wav, sample_rate=16000)  # numpy / torch waveform
+asr.transcribe("audio.wav", streaming=True)  # streaming decoding
+asr.transcribe("audio.wav", beam_width=8)  # smaller LM beam
 ```
 
 `transcribe` arguments:
@@ -423,15 +423,15 @@ streamed transcript, or hold the record button to transcribe from the mic.
 | `GET` | `/v1/models` | – | List the served model |
 | `GET` | `/v1/models/{id}` | – | Fetch one model |
 | `GET` | `/health` | – | Liveness plus real model state |
-| `GET` | `/metrics` | – | Request counters and engine info |
+| `GET` | `/metrics` | key | Request counters and engine info; JSON, or Prometheus text when asked |
 | `GET` | `/` | – | Browser playground |
 | `GET` | `/docs` | – | Swagger UI (FastAPI default) |
 | `GET` | `/openapi.json` | – | OpenAPI schema (FastAPI default) |
 
-"key" means the route requires `Authorization: Bearer <API_KEY>` **only when
-`API_KEY` is set**; with no `API_KEY` every route is open. The read-only routes
-above are always open, which is deliberate: an orchestrator must be able to probe
-`/health` without credentials.
+"key" means the route needs a valid API key **only when `API_KEY` is set**; with no `API_KEY`
+every route is open. The health and liveness probes above stay open even then,
+which is deliberate: an orchestrator must be able to probe `/health` without
+credentials.
 
 #### `POST /v1/audio/transcriptions`
 
@@ -452,14 +452,14 @@ Extensions this server adds:
 | --- | --- | --- | --- |
 | `stream` | `false` | bool | Return Server-Sent Events instead of a buffered body |
 | `stream_partials` | `true` | bool | Emit in-progress `transcript.text.delta` events while streaming |
-| `punctuate` | `false` | bool | Intelligent punctuation, capitalization & Inverse Text Normalization (ITN) |
+| `punctuate` | `PUNCTUATE` | bool | Intelligent punctuation, capitalization & Inverse Text Normalization (ITN). An explicit value wins over the server default |
 | `phonemes` | `false` | bool | Grapheme-to-Phoneme IPA output powered by [`sea-g2p`](https://github.com/pnnbao97/sea-g2p) |
 | `norm_mode` | `itn` | `itn`/`tn`/`none` | Text norm mode: `itn` (spoken to digits/symbols), `tn` (`sea-g2p` spoken words), or `none` |
 | `use_lm` | server setting | bool | Force beam search on/off for this request |
 | `beam_width` | `32` | `1`–`256` | Beams kept by the beam search |
 | `left_chunks` | server setting | `>= 0` | Past chunks the reader may attend to; `0` = lowest latency |
 | `chunk_seconds` | `30` | `1`–`300` | Cut long audio into pieces of at most this many seconds |
-| `timestamp_granularities[]` | – | `word`/`segment` | Only valid with `verbose_json`, `srt` or `vtt` |
+| `timestamp_granularities[]` | – | `segment` | `word` is rejected: this is a single-pass CTC model with segment-level alignment only. Only valid with `verbose_json`, `srt` or `vtt` |
 
 Out-of-range values and unknown `response_format`/`language` values are rejected
 with `400` — see [Errors and limits](#errors-and-limits). **Unknown form fields
@@ -505,10 +505,11 @@ curl -s -F "file=@sample.wav" -F "use_lm=true" -F "beam_width=32" \
 quiet points where the audio was actually cut, so the timestamps line up with
 what the model decoded. Segments split mid-sentence are merged back together when
 there is no terminal punctuation and the gap is under 0.5 s. Per-sentence
-timestamps are the finest granularity available: `words` is always `[]` and the
-`tokens` arrays are placeholders, because a single CTC pass does not produce
-per-token alignment. `timestamp_granularities[]` is accepted for compatibility
-and only affects whether that merge is suppressed.
+timestamps are the finest granularity available: the `tokens` arrays are
+placeholders, because a single CTC pass does not produce per-token alignment.
+`timestamp_granularities[]=segment` is accepted for compatibility and only
+affects whether that merge is suppressed; `word` is rejected with `400` rather
+than silently returning an empty `words` list.
 
 ##### Model aliases
 
@@ -544,15 +545,16 @@ The full set of `code` values, with the HTTP status and when they fire:
 | `401` | `invalid_api_key` | `authentication_error` | `API_KEY` set and the token is missing or wrong |
 | `404` | `model_not_found` | `invalid_request_error` | `model` is not the served model or one of its aliases |
 | `404` | `not_found` | `invalid_request_error` | Unknown route |
-| `413` | `payload_too_large` | `invalid_request_error` | Upload larger than `MAX_UPLOAD_MB` (default `200`) |
-| `503` | `server_busy` | `server_error` | The decode queue is full — retry after the backlog clears |
-| `503` | – | `server_error` | The model is still loading, or a requested LM is not loaded |
+| `413` | `payload_too_large` | `invalid_request_error` | Upload larger than `MAX_UPLOAD_MB` (default `200`); detected while reading, so the body is never fully buffered |
+| `503` | `server_busy` | `server_error` | The decode queue is full or too many uploads are in flight — retry after `Retry-After` |
+| `503` | – | `server_error` | The model is still loading, or a requested LM is not loaded — retry after `Retry-After` |
 
 Two caveats worth knowing:
 
 - **`server_busy` is retryable and intentional.** It is the scheduler refusing
   work rather than parking another thread and letting latency grow without
-  bound — see [Performance](#performance). Back off and retry.
+  bound — see [Performance](#performance). Every `503` carries a `Retry-After`
+  header in seconds, so a client can back off without guessing.
 - **A mid-stream failure is not an HTTP error.** Once an SSE response has
   started, the status is already `200`; a decode failure arrives as an `error`
   event in the body (see below). If you need a trustworthy status code, use the
@@ -560,8 +562,8 @@ Two caveats worth knowing:
 
 Limits that are enforced, in one place: `MAX_UPLOAD_MB` (413), `MAX_STREAM_SECONDS`
 for WebSocket sessions, `chunk_seconds` ∈ [1, 300], `beam_width` ∈ [1, 256],
-`temperature` ∈ [0, 1], `left_chunks` ≥ 0, and the two queue caps `MAX_QUEUE` /
-`MAX_INTERACTIVE` (503).
+`temperature` ∈ [0, 1], `left_chunks` ≥ 0, the two queue caps `MAX_QUEUE` /
+`MAX_INTERACTIVE`, and `MAX_INFLIGHT_REQUESTS` (503).
 
 ### Observability
 
@@ -583,13 +585,21 @@ before that.
 
 #### `GET /metrics`
 
-`{**engine.metrics(), **engine.info()}` — request counters, resolved
-configuration, and the scheduler's own view:
+Honours `API_KEY` like the transcription endpoint. JSON by default, so the
+bundled playground can `res.json()` it; send
+`Accept: application/openmetrics-text` (or `Accept: text/plain`) to get the
+Prometheus text exposition format (`quan_asr_*` gauges, terminated by `# EOF`)
+for a scrape config.
+
+The body is `{**engine.metrics(), **engine.info()}` — request counters, resolved
+configuration, and the scheduler's own view. Deployment details that reveal
+filesystem layout or a load failure (`model_path`, `lm_path`, `load_error`) are
+only on `/health`, not here:
 
 | Group | Keys |
 | --- | --- |
 | Counters | `requests_total`, `audio_seconds_total`, `decode_seconds_total`, `realtime_factor` |
-| Model | `model`, `model_path`, `loaded`, `device`, `profile`, `language`, `lm`, `lm_path`, `lm_alpha`, `lm_beta`, `beam_width`, `load_error`, `load_seconds`, `loaded_at` |
+| Model | `model`, `loaded`, `device`, `profile`, `language`, `lm`, `lm_alpha`, `lm_beta`, `beam_width`, `load_seconds`, `loaded_at` |
 | Live streaming | `chunk_seconds`, `stream_step_seconds`, `left_chunks` |
 | Scheduler config | `microbatch_seconds`, `microbatch_max_requests`, `microbatch_max_wait_ms`, `max_queue`, `max_interactive`, `subbatch_seconds`, `tf32` |
 | `core` | `batches_run`, `pieces_run`, `jobs_run`, `queued_pieces`, `queued_interactive`, `shed`, `avg_batch_size`, `p50_latency_ms`, `p95_latency_ms`, `model_seconds` |
@@ -705,6 +715,7 @@ import soundfile as sf
 URL = "ws://127.0.0.1:8000/v1/audio/transcriptions/stream?format=f32"
 STEP = int(0.48 * 16000)
 
+
 async def main(path="mic16k.wav"):
     audio, sr = sf.read(path, dtype="float32", always_2d=True)
     assert sr == 16000, f"resample first: got {sr} Hz"
@@ -722,6 +733,7 @@ async def main(path="mic16k.wav"):
             print(message)
             if '"session.closed"' in message:
                 break
+
 
 asyncio.run(main())
 ```
@@ -914,9 +926,10 @@ more than one client at a time. See [Performance](#performance).
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | |
-| `API_KEY` | – | When set, `POST /v1/audio/transcriptions` and the WebSocket need `Authorization: Bearer <key>` (REST also accepts `x-api-key`; the socket also accepts `?api_key=`) |
+| `API_KEY` | – | When set, `POST /v1/audio/transcriptions`, `GET /metrics` and the WebSocket need `Authorization: Bearer <key>` (REST also accepts `x-api-key`; the socket also accepts `?api_key=`) |
 | `CORS_ORIGINS` | `*` | Comma-separated |
-| `MAX_UPLOAD_MB` | `200` | Rejects larger uploads with `413` |
+| `MAX_UPLOAD_MB` | `200` | Rejects larger uploads with `413`, detected while the body is read |
+| `MAX_INFLIGHT_REQUESTS` | `8` | Admission control: most uploads decoded-and-waiting at once; extra requests get `503` + `Retry-After`. `0` disables the cap |
 | `LOG_LEVEL` | `info` | |
 
 `/health` reports `loading` while the weights download and only fails after a

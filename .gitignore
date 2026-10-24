@@ -19,6 +19,10 @@ venv/
 hf-home/
 cache/
 
+# Vendored model weights. Fetch them with scripts/fetch_punctuator.py; they are
+# 116 MB (int8) and belong in the Docker image or a release asset, not in git.
+models/
+
 # Audio fixtures written by scripts/make_sample_audio.py
 *.wav
 !tests/**/*.wav

@@ -8,6 +8,12 @@ This module provides high-speed, rule-based and vocabulary-driven post-processin
 2. Punctuation: Detects questions (ai, gì, ở đâu, phải không...), exclamations, pauses.
 3. Inverse Text Normalization (ITN): Converts spoken Vietnamese numbers into digits,
    percentages, currencies, and dates.
+
+The regex capitalization and punctuation steps are a fallback. When a
+:class:`~app.punctuate.Punctuator` is supplied and loaded, it replaces both with
+a ViBERT model that predicts ``. , : ?`` and complex casing per word — things a
+regex cannot reach, because it can only append a terminal mark. See
+``app/punctuate.py`` for why that model exists and what it costs.
 """
 
 from __future__ import annotations
@@ -431,12 +437,18 @@ class PostProcessor:
         enable_capitalization: bool = True,
         enable_g2p: bool = False,
         norm_mode: str = "itn",
+        punctuator: Any | None = None,
     ) -> None:
         self.enable_punctuation = enable_punctuation
         self.enable_itn = enable_itn
         self.enable_capitalization = enable_capitalization
         self.enable_g2p = enable_g2p
         self.norm_mode = norm_mode
+        #: An optional :class:`~app.punctuate.Punctuator`. When present and
+        #: loaded it replaces the regex capitalization and punctuation steps,
+        #: which cannot place a comma or a colon at all. ``None`` keeps the
+        #: regex path, so the model stays strictly optional.
+        self.punctuator = punctuator
 
     def process(self, text: str, is_final: bool = True) -> str:
         """Run the configured post-processing steps on raw transcript text."""
@@ -449,6 +461,14 @@ class PostProcessor:
         elif self.norm_mode == "itn" and self.enable_itn:
             result = inverse_text_normalization(result)
 
+        # The model restores punctuation *and* capitalization in one pass, so it
+        # replaces both regex steps rather than composing with them. Running the
+        # regexes afterwards would undo its work: ``capitalize_vietnamese``
+        # lowercases nothing but ``punctuate_vietnamese`` would append a second
+        # terminal mark to a segment the model already ended.
+        if self._model_ready():
+            return self.punctuator.restore(result)
+
         if self.enable_capitalization:
             result = capitalize_vietnamese(result)
 
@@ -456,6 +476,15 @@ class PostProcessor:
             result = punctuate_vietnamese(result, is_final=is_final)
 
         return result
+
+    def _model_ready(self) -> bool:
+        """True when the punctuator is configured and its weights are loaded.
+
+        Deliberately checks ``loaded`` rather than calling ``load()``: a request
+        must never pay a multi-second model download, and a load failure must
+        fall back to the regex path instead of failing the request.
+        """
+        return self.punctuator is not None and self.punctuator.loaded
 
     def process_segments(
         self,

@@ -27,6 +27,7 @@ import numpy as np
 from .audio import SAMPLE_RATE, Segment
 from .config import Settings
 from .core import EngineBusy, EngineCore
+from .punctuate import Punctuator, PunctuatorConfig
 from .vad import VoiceActivityDetector
 
 __all__ = [
@@ -85,6 +86,9 @@ class TranscriptionEngine:
         # Voice activity detection runs on request threads, never the model
         # thread, so it never blocks a decode. Created on first use.
         self._vad: VoiceActivityDetector | None = None
+        # Punctuation restoration also runs on request threads. Created on first
+        # use, and only when the punctuator is enabled.
+        self._punctuator: Punctuator | None = None
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -291,9 +295,12 @@ class TranscriptionEngine:
             "max_interactive": self.settings.max_interactive,
             "subbatch_seconds": self.settings.subbatch_seconds,
             "tf32": self.settings.tf32,
-            "vad": self._vad.stats() if self._vad is not None else {
-                "enabled": self.settings.use_vad
-            },
+            "vad": self._vad.stats()
+            if self._vad is not None
+            else {"enabled": self.settings.use_vad},
+            "punctuator": self._punctuator.stats()
+            if self._punctuator is not None
+            else {"enabled": self.settings.use_punctuator},
             "load_error": self._load_error,
             "load_seconds": self._load_seconds,
             "loaded_at": self._loaded_at,
@@ -314,6 +321,9 @@ class TranscriptionEngine:
             "loaded": self.is_loaded,
             "core": core,
             "vad": self._vad.stats() if self._vad is not None else None,
+            "punctuator": self._punctuator.stats()
+            if self._punctuator is not None
+            else None,
         }
 
     def describe_device(self) -> str:
@@ -322,7 +332,10 @@ class TranscriptionEngine:
 
             if torch.cuda.is_available():
                 return f"cuda ({torch.cuda.get_device_name(0)})"
-            if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            if (
+                getattr(torch.backends, "mps", None)
+                and torch.backends.mps.is_available()
+            ):
                 return "mps"
         except ImportError:
             # torch is absent only in a stripped-down test environment.
@@ -419,6 +432,43 @@ class TranscriptionEngine:
             self._vad = VoiceActivityDetector(self.settings.vad)
         return self._vad
 
+    @property
+    def punctuator(self) -> Punctuator | None:
+        """The shared punctuation model, or ``None`` when it is disabled.
+
+        Created once and reused so the ONNX session is loaded a single time.
+        Unlike the VAD this is *not* loaded eagerly: ``PostProcessor`` only uses
+        it once ``loaded`` is true, so a request never pays the download and a
+        load failure falls back to the regex path instead of failing.
+        """
+        if not self.settings.use_punctuator:
+            return None
+        if self._punctuator is None:
+            self._punctuator = Punctuator(
+                PunctuatorConfig(
+                    enabled=True,
+                    model=self.settings.punctuator_model,
+                    int8=self.settings.punctuator_int8,
+                    max_words=self.settings.punctuator_max_words,
+                )
+            )
+        return self._punctuator
+
+    def load_punctuator(self) -> None:
+        """Load the punctuation model now, logging rather than raising on failure.
+
+        Called from the startup preload so the first request does not pay the
+        download. A failure is not fatal: the regex path still works, and
+        ``/health`` reports the reason through ``punctuator.load_error``.
+        """
+        punctuator = self.punctuator
+        if punctuator is None:
+            return
+        try:
+            punctuator.load()
+        except Exception as exc:
+            logger.warning("punctuation model failed to load: %s", exc)
+
     def _regions_for(self, wav: np.ndarray) -> list[tuple[int, int]] | None:
         """VAD speech ranges to decode, or ``None`` to use the whole waveform.
 
@@ -434,7 +484,9 @@ class TranscriptionEngine:
         try:
             return vad.regions(wav, keep_silence=not vad.trim_silence)
         except Exception:
-            logger.warning("voice activity detection failed; decoding all audio", exc_info=True)
+            logger.warning(
+                "voice activity detection failed; decoding all audio", exc_info=True
+            )
             return None
 
     def transcribe(
@@ -500,9 +552,7 @@ class TranscriptionEngine:
         step = max(1, round(step_seconds * SAMPLE_RATE))
         step_seconds = step / SAMPLE_RATE
 
-        session = self._new_live_session(
-            left_chunks, chunk_seconds, use_lm, beam_width
-        )
+        session = self._new_live_session(left_chunks, chunk_seconds, use_lm, beam_width)
         total = len(wav)
         consumed = 0
         last_end = 0.0
@@ -538,6 +588,7 @@ class TranscriptionEngine:
         it preempts queued bulk pieces rather than waiting behind them: a 0.48 s
         microphone step should never queue behind a ten-minute file.
         """
+
         def step() -> tuple[list[str], str]:
             finals = session.accept(block)
             return finals, session.partial
@@ -729,9 +780,7 @@ class LiveStream:
             events.append(StreamEvent("final", final, self._last_end, now))
             self._last_end = now
         if partial:
-            events.append(
-                StreamEvent("partial", partial, self._last_end, now)
-            )
+            events.append(StreamEvent("partial", partial, self._last_end, now))
         return events
 
     def flush(self) -> str:
@@ -743,13 +792,19 @@ class LiveStream:
             if self._pending.size == 0:
                 self._closed = True
                 return ""
-            text = self.engine.transcribe(
+            segments = self.engine.transcribe(
                 self._pending,
                 streaming=False,
                 chunk_seconds=self.chunk_seconds,
                 use_lm=self.use_lm,
                 beam_width=self.beam_width,
-            )[0].text
+            )
+            if not segments:
+                # Below MIN_PIECE_SECONDS nothing decodes, and that is not an
+                # error: a client may flush after 50 ms of silence.
+                self._closed = True
+                return ""
+            text = segments[0].text
             self._closed = True
             return text
 

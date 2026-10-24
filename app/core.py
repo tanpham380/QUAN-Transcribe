@@ -96,6 +96,13 @@ class EngineBusy(RuntimeError):
     layer maps it to a ``503`` with ``Retry-After``.
     """
 
+    def __init__(self, message: str, *, retry_after: int = 1) -> None:
+        super().__init__(message)
+        #: Suggested wait before retrying, in seconds. Surfaced as ``Retry-After``
+        #: so well-behaved clients back off instead of hammering a saturated
+        #: server (openai-python reads exactly this header).
+        self.retry_after = retry_after
+
 class _Piece:
     """One audio piece waiting for its turn through the model."""
 
@@ -292,9 +299,21 @@ class EngineCore:
                 self._max_queued_pieces
                 and len(self._bulk) + len(pieces) > self._max_queued_pieces
             ):
-                self.shed += 1
-                raise EngineBusy(
-                    "the decode queue is full; retry once the backlog clears"
+                # The cap exists to shed *contention*, not to reject work that
+                # could not fit in an empty queue: a single job larger than the
+                # cap would otherwise fail forever, no matter how idle the
+                # server is. Let it through on its own; the cap still applies to
+                # everything queued behind it.
+                if self._bulk:
+                    self.shed += 1
+                    raise EngineBusy(
+                        "the decode queue is full; retry once the backlog clears"
+                    )
+                logger.debug(
+                    "admitting %d pieces past the queue cap (%d) because the "
+                    "queue is empty",
+                    len(pieces),
+                    self._max_queued_pieces,
                 )
             self._bulk.extend(pieces)
             self._cv.notify_all()
@@ -527,8 +546,12 @@ class EngineCore:
         }
 
     def _percentile(self, quantile: float) -> float | None:
-        if not self._latencies:
+        # ``sorted`` on a deque being appended to by another thread can raise,
+        # so take a snapshot first. It also keeps the sort off the hot path that
+        # records latencies.
+        sample = list(self._latencies)
+        if not sample:
             return None
-        ordered = sorted(self._latencies)
+        ordered = sorted(sample)
         index = min(len(ordered) - 1, int(quantile * len(ordered)))
         return round(ordered[index] * 1000.0, 3)

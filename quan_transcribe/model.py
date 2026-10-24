@@ -11,6 +11,7 @@ it. The encoder's own attention is already chunked (12 frames, left context only
 so no part of the network looks more than one chunk ahead.
 """
 
+import math
 from dataclasses import dataclass, fields
 
 import torch
@@ -33,6 +34,7 @@ class ModelConfig:
     ff_mult: int = 4
     conv_kernel: int = 15
     layer_mix: bool = True  # weighted sum of all encoder hidden states (else: last layer only)
+    head_cosine: bool = False  # score units by cosine similarity instead of a dot product (VieGem-ASR checkpoints)
     unfreeze_top_k: int = 0  # top encoder layers that were fine-tuned (their weights are in the checkpoint)
     chunk_frames: int = 12  # streaming chunk size in encoder frames (40 ms each)
 
@@ -108,6 +110,8 @@ class QuanCTC(nn.Module):
         self.unit_rows = nn.Parameter(torch.zeros(cfg.vocab_size - 2, text_dim))
         self.special_rows = nn.Parameter(torch.zeros(2, text_dim))  # blank, unk
         self.head_bias = nn.Parameter(torch.zeros(cfg.vocab_size))
+        # Cosine head: a learned logit scale replaces the magnitude of the dot product.
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(10.0))) if cfg.head_cosine else None
 
     def _encoder_hidden(self, feats: torch.Tensor, feat_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         self._acts.clear()
@@ -148,7 +152,11 @@ class QuanCTC(nn.Module):
             x = blk(x, attn_mask)
         t = self.to_text(self.out_norm(x))
         rows = torch.cat([self.special_rows, self.unit_rows], dim=0)
-        logits = t.float() @ rows.float().t() + self.head_bias.float()
+        if self.cfg.head_cosine:
+            logits = self.logit_scale.exp() * (F.normalize(t.float(), dim=-1) @ F.normalize(rows.float(), dim=-1).t())
+        else:
+            logits = t.float() @ rows.float().t()
+        logits = logits + self.head_bias.float()
         return logits, mask.sum(1)
 
 
